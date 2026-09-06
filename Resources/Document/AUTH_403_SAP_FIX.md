@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十一个 commit：
+二十二个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -556,6 +556,16 @@ exchange.2         +130.5s  took  4.4s
 `0021` 把数字码加在真正抛错的那一行。
 
 **具体是哪条规则，仍然未知**，要等带数字码的那一次。
+
+## 历史版本加载失败，同样没被记录
+
+`versionFinder.ts` 和 `download.ts` 是同一个毛病：`9610` 抛
+`"License required - purchase the app first"`，default 抛 `customerMessage`，
+都不带 `failureType`。而且 `VersionHistory.tsx` 只弹 toast，**不写活动日志**，
+所以报告里关于版本历史一个字都没有。
+
+`0022` 两处都补：错误带上数字码，加载动作（成败、耗时、原因）进 `[activity]`，
+类型新增 `versions`。
 
 ## 我验证到了什么（全部本次实跑）
 

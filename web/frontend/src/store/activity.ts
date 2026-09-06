@@ -10,7 +10,7 @@ import { create } from "zustand";
  */
 export interface ActivityEntry {
   at: number;
-  kind: "search" | "license" | "download" | "authenticate";
+  kind: "search" | "license" | "download" | "versions" | "authenticate";
   /** What it was about, as the user would recognise it. Never a credential. */
   target: string;
   ok: boolean;

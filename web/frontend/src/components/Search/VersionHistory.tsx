@@ -9,6 +9,7 @@ import { listVersions } from "../../apple/versionFinder";
 import { storeIdToCountry } from "../../apple/config";
 import { getVersionMetadata } from "../../apple/versionLookup";
 import { getErrorMessage } from "../../utils/error";
+import { useActivityStore } from "../../store/activity";
 import { useToastStore } from "../../store/toast";
 import type { Software, VersionMetadata } from "../../types";
 
@@ -18,6 +19,7 @@ export default function VersionHistory() {
   const { accounts, updateAccount } = useAccounts();
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
+  const recordActivity = useActivityStore((s) => s.record);
   const { startDownload, toastDownloadError } = useDownloadAction();
 
   const stateApp = (location.state as { app?: Software; country?: string })
@@ -56,11 +58,27 @@ export default function VersionHistory() {
   async function handleLoadVersions() {
     if (!account || !app) return;
     setLoading(true);
+    const beganAt = Date.now();
     try {
       const result = await listVersions(account, app);
       setVersions(result.versions);
       await updateAccount({ ...account, cookies: result.updatedCookies });
+      recordActivity({
+        kind: "versions",
+        target: app.name,
+        ok: true,
+        tookMs: Date.now() - beganAt,
+      });
     } catch (e) {
+      // This failed silently as far as the report was concerned: the toast
+      // went by and nothing was written down.
+      recordActivity({
+        kind: "versions",
+        target: app.name,
+        ok: false,
+        detail: getErrorMessage(e, "unknown"),
+        tookMs: Date.now() - beganAt,
+      });
       addToast(getErrorMessage(e, t("search.versions.loadFailed")), "error");
     } finally {
       setLoading(false);

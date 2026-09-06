@@ -79,12 +79,18 @@ export async function listVersions(
 
         switch (failureType) {
           case "2034":
-            throw new Error("Password token is expired");
+            throw new Error("Password token is expired (2034)");
           case "9610":
-            throw new Error("License required - purchase the app first");
+            throw new Error("License required - purchase the app first (9610)");
           default: {
+            // The same dead end the download had: Apple's words alone, with the
+            // code that says which rule refused left behind in the response.
             const msg = dict.customerMessage as string | undefined;
-            throw new Error(msg ?? "No items in response");
+            throw new Error(
+              msg
+                ? `${msg} (${failureType})`
+                : `No items in response (${failureType})`,
+            );
           }
         }
       }
