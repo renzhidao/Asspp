@@ -1,0 +1,498 @@
+From 9c6c76d4eb7bcd331d154203000f28e7eb36d22c Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 11:55:14 +0000
+Subject: [PATCH] Fail an abandoned SAP setup instead of orphaning it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A third report from the field came back at stage: setup after more than 500
+seconds with no error, and said that navigating to another page and back
+restarted the count. Both point at one bug.
+
+The add-account form holds its device id in useState(() => generateDeviceId()),
+so remounting it yields a different one. A signer is bound to its hardware id,
+so prepareSigner() took the rebuild branch and called reset() — which rejects
+the pending sign requests but never touches settleSetup, where the setup
+promise lives. It only nulled `ready`. The caller in authenticate() was left
+holding a promise nothing would ever settle, so the screen sat on "initialising
+the signer" until the 15 minute guard fired. The worker had been terminate()d
+cleanly, so onerror never fired either. That is the mechanism behind the wait.
+
+Three changes:
+
+- reset() now fails settleSetup explicitly, so an abandoned setup reports
+  instead of hanging.
+- The count's start moves from component state into the store as
+  setupStartedAt, so navigating away and back shows how long setup has really
+  been running. A wait nine minutes in should not read as one that just began.
+- The report gains a setupSeconds line. Setup is the only stage with no
+  percentage, and every published timing for it is desktop or Node, so
+  "stage: setup" alone cannot answer the "is it stuck?" that the last three
+  reports arrived asking.
+
+Left alone deliberately: the device id regenerating per mount is intentional —
+one device per account, with a regenerate button beside it. It does mean
+navigating rebuilds the signer and repeats the whole setup. That is now a
+wasted wait rather than a permanent one, and persisting it is a product
+decision rather than a bug fix.
+
+Each fix was verified by reverting it: the orphaned-promise test times out at
+15s without the reject, and the elapsed test fails with 'expected +0 to be 120'
+without the store-backed start.
+---
+ frontend/src/apple/sap/client.ts              | 10 +++
+ .../components/Settings/DiagnosticsModal.tsx  |  6 +-
+ frontend/src/components/common/SapStatus.tsx  | 18 ++--
+ frontend/src/store/sap.ts                     | 33 +++++++-
+ frontend/src/utils/diagnostics.ts             | 15 ++++
+ frontend/tests/apple/sapClient.test.ts        | 83 +++++++++++++++++++
+ .../components/DiagnosticsModal.test.tsx      |  8 +-
+ frontend/tests/components/SapStatus.test.tsx  | 72 ++++++++++++++++
+ frontend/tests/utils/diagnostics.test.ts      | 33 +++++++-
+ 9 files changed, 265 insertions(+), 13 deletions(-)
+ create mode 100644 frontend/tests/apple/sapClient.test.ts
+ create mode 100644 frontend/tests/components/SapStatus.test.tsx
+
+diff --git a/frontend/src/apple/sap/client.ts b/frontend/src/apple/sap/client.ts
+index f75d346..482d851 100644
+--- a/frontend/src/apple/sap/client.ts
++++ b/frontend/src/apple/sap/client.ts
+@@ -95,6 +95,15 @@ function reset(error: Error) {
+   for (const waiter of pending.values()) waiter.reject(error);
+   pending.clear();
+ 
++  // The setup promise is not in `pending` — it is settled through
++  // settleSetup — so it has to be failed here explicitly. Without this, a
++  // setup abandoned mid-way leaves its caller waiting on a promise nothing
++  // will ever resolve, and the screen sits on "initialising the signer" until
++  // the 15 minute guard fires.
++  const abandoned = settleSetup;
++  settleSetup = null;
++  abandoned?.reject(error);
++
+   worker?.terminate();
+   worker = null;
+   ready = null;
+@@ -117,6 +126,7 @@ export function prepareSigner(
+   onProgress = progress ?? null;
+ 
+   if (ready && preparedFor === hardwareID) return ready;
++
+   if (ready) reset(new Error("SAP signer rebuilt for a different device"));
+ 
+   preparedFor = hardwareID;
+diff --git a/frontend/src/components/Settings/DiagnosticsModal.tsx b/frontend/src/components/Settings/DiagnosticsModal.tsx
+index 5da7276..ea9c4d7 100644
+--- a/frontend/src/components/Settings/DiagnosticsModal.tsx
++++ b/frontend/src/components/Settings/DiagnosticsModal.tsx
+@@ -32,7 +32,7 @@ export default function DiagnosticsModal({
+ }) {
+   const { t, i18n } = useTranslation();
+   const accounts = useAccountsStore((state) => state.accounts);
+-  const { stage, percent, error, hardwareID } = useSapStore();
++  const { stage, percent, error, hardwareID, setupStartedAt } = useSapStore();
+   const addToast = useToastStore((state) => state.addToast);
+ 
+   const [report, setReport] = useState<string | null>(null);
+@@ -72,6 +72,10 @@ export default function DiagnosticsModal({
+           signer: {
+             stage,
+             percent,
++            setupSeconds:
++              setupStartedAt === null
++                ? null
++                : Math.round((Date.now() - setupStartedAt) / 1000),
+             error,
+             hardwareID: maskHardwareID(hardwareID),
+           },
+diff --git a/frontend/src/components/common/SapStatus.tsx b/frontend/src/components/common/SapStatus.tsx
+index 3eae054..e66d06a 100644
+--- a/frontend/src/components/common/SapStatus.tsx
++++ b/frontend/src/components/common/SapStatus.tsx
+@@ -20,6 +20,7 @@ export default function SapStatus() {
+   const stage = useSapStore((state) => state.stage);
+   const percent = useSapStore((state) => state.percent);
+   const error = useSapStore((state) => state.error);
++  const setupStartedAt = useSapStore((state) => state.setupStartedAt);
+ 
+   // Setting a signer up is a long, single-threaded wait inside the worker, and
+   // the worker cannot report from inside it — so from outside it is
+@@ -27,21 +28,28 @@ export default function SapStatus() {
+   // real numbers to show; this one has none, so it counts up instead. A number
+   // that moves is the only honest "still working" available here, and the wait
+   // is long enough that a fixed estimate reads as a hang once it is passed.
+-  const [elapsed, setElapsed] = useState(0);
++  //
++  // The start comes from the store rather than from mounting, so navigating
++  // away and back shows how long the setup has really been running instead of
++  // restarting the count — on a phone this wait runs to many minutes, and a
++  // clock that reads zero again says the opposite of the truth.
++  const [elapsed, setElapsed] = useState(() =>
++    setupStartedAt === null ? 0 : Math.round((Date.now() - setupStartedAt) / 1000),
++  );
+ 
+   useEffect(() => {
+-    if (stage !== "setup") {
++    if (stage !== "setup" || setupStartedAt === null) {
+       setElapsed(0);
+       return;
+     }
+ 
+-    const startedAt = Date.now();
++    setElapsed(Math.round((Date.now() - setupStartedAt) / 1000));
+     const timer = setInterval(
+-      () => setElapsed(Math.round((Date.now() - startedAt) / 1000)),
++      () => setElapsed(Math.round((Date.now() - setupStartedAt) / 1000)),
+       1000,
+     );
+     return () => clearInterval(timer);
+-  }, [stage]);
++  }, [stage, setupStartedAt]);
+ 
+   if (stage === "idle" || stage === "ready") return null;
+ 
+diff --git a/frontend/src/store/sap.ts b/frontend/src/store/sap.ts
+index bcc3752..d5da0c9 100644
+--- a/frontend/src/store/sap.ts
++++ b/frontend/src/store/sap.ts
+@@ -21,6 +21,15 @@ interface SapStore {
+   stage: SapStage;
+   /** 0 to 100 while assets download, null once past that. */
+   percent: number | null;
++  /**
++   * When the setup stage began, in epoch milliseconds, or null outside it.
++   *
++   * Setup is the one long wait with no progress to report, so the screen
++   * counts seconds instead — and that count has to survive the component that
++   * renders it unmounting, or navigating away and back restarts it at zero and
++   * makes a wait already nine minutes old look like one that just began.
++   */
++  setupStartedAt: number | null;
+   error: string | null;
+   /** The hardware id the signer was prepared for. */
+   hardwareID: string | null;
+@@ -36,16 +45,32 @@ interface SapStore {
+ export const useSapStore = create<SapStore>((set) => ({
+   stage: "idle",
+   percent: null,
++  setupStartedAt: null,
+   error: null,
+   hardwareID: null,
+ 
+   begin: (hardwareID) =>
+-    set({ stage: "assets", percent: 0, error: null, hardwareID }),
++    set({
++      stage: "assets",
++      percent: 0,
++      setupStartedAt: null,
++      error: null,
++      hardwareID,
++    }),
+   setInstalling: () => set({ stage: "installing", percent: null }),
+   setAssets: (percent) => set({ stage: "assets", percent }),
+-  setSetup: () => set({ stage: "setup", percent: null }),
+-  setReady: () => set({ stage: "ready", percent: null, error: null }),
+-  setError: (message) => set({ stage: "error", percent: null, error: message }),
++  // Timestamped once, on entry. Re-entering the stage is a fresh setup and
++  // does get a fresh start, but a remount of the screen showing it does not.
++  setSetup: () =>
++    set((state) =>
++      state.stage === "setup" && state.setupStartedAt !== null
++        ? { stage: "setup", percent: null }
++        : { stage: "setup", percent: null, setupStartedAt: Date.now() },
++    ),
++  setReady: () =>
++    set({ stage: "ready", percent: null, setupStartedAt: null, error: null }),
++  setError: (message) =>
++    set({ stage: "error", percent: null, setupStartedAt: null, error: message }),
+ }));
+ 
+ /** A human-readable line for the current stage, or null when there is nothing to say. */
+diff --git a/frontend/src/utils/diagnostics.ts b/frontend/src/utils/diagnostics.ts
+index e17444d..1893821 100644
+--- a/frontend/src/utils/diagnostics.ts
++++ b/frontend/src/utils/diagnostics.ts
+@@ -44,6 +44,15 @@ export interface DiagnosticsInput {
+   signer: {
+     stage: SapStage;
+     percent: number | null;
++    /**
++     * How long the setup stage has been running, or null outside it.
++     *
++     * Setup is the one stage with no progress to report, and the only
++     * measurements of it are on desktop and in Node — so "is it stuck?" cannot
++     * be answered from the stage name alone. The elapsed time says how far
++     * into a wait that has no other observable the reader is.
++     */
++    setupSeconds: number | null;
+     error: string | null;
+     /** Masked before it gets here; see maskHardwareID. */
+     hardwareID: string | null;
+@@ -149,6 +158,12 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
+   out.push("[signer]");
+   out.push(line("  stage", input.signer.stage));
+   out.push(line("  percent", input.signer.percent));
++  out.push(
++    line(
++      "  setupSeconds",
++      input.signer.setupSeconds === null ? null : input.signer.setupSeconds,
++    ),
++  );
+   out.push(line("  hardwareID", input.signer.hardwareID));
+   if (input.signer.error) {
+     out.push("  error:");
+diff --git a/frontend/tests/apple/sapClient.test.ts b/frontend/tests/apple/sapClient.test.ts
+new file mode 100644
+index 0000000..c8c13cd
+--- /dev/null
++++ b/frontend/tests/apple/sapClient.test.ts
+@@ -0,0 +1,83 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++
++// jsdom has no Worker, and client.ts constructs one at module scope of
++// prepareSigner, so the whole thing is replaced. Every instance is recorded so
++// a test can tell which one was terminated.
++const workers = vi.hoisted(() => [] as unknown[]);
++
++class FakeWorker {
++  static instances: FakeWorker[] = [];
++  onmessage: ((event: MessageEvent) => void) | null = null;
++  onerror: ((event: ErrorEvent) => void) | null = null;
++  readonly posted: unknown[] = [];
++  terminated = false;
++
++  constructor() {
++    FakeWorker.instances.push(this);
++  }
++
++  postMessage(message: unknown) {
++    if (this.terminated) throw new Error("posted to a terminated worker");
++    this.posted.push(message);
++  }
++
++  terminate() {
++    this.terminated = true;
++  }
++}
++
++vi.stubGlobal("Worker", FakeWorker);
++
++vi.mock("../../src/components/Auth/PasswordGate", () => ({ getAccessToken: () => null }));
++
++const { prepareSigner } = await import("../../src/apple/sap/client");
++const { useSapStore } = await import("../../src/store/sap");
++
++// A signer's setup never resolves on its own here; a test settles it by hand.
++const settle = (worker: FakeWorker, type: "ready" | "error", message = "boom") =>
++  worker.onmessage?.({
++    data: type === "ready" ? { type: "ready" } : { type: "error", message },
++  } as MessageEvent);
++
++describe("prepareSigner rebuilding for a different hardware id", () => {
++  beforeEach(() => {
++    FakeWorker.instances.length = 0;
++    useSapStore.setState({ stage: "idle", percent: null, error: null, hardwareID: null });
++  });
++
++  afterEach(() => {
++    for (const worker of FakeWorker.instances) if (!worker.terminated) worker.terminate();
++  });
++
++  it("kills the old worker and keeps the new one alive to finish the setup", async () => {
++    const first = prepareSigner("aaaaaaaaaaaa");
++    settle(FakeWorker.instances[0] as FakeWorker, "ready");
++    await first;
++
++    // Only now is there something to rebuild: `ready` is set, so a different
++    // hardware id takes the rebuild path and reset() runs.
++    const second = prepareSigner("bbbbbbbbbbbb");
++
++    const [oldWorker, newWorker] = FakeWorker.instances as FakeWorker[];
++    expect(FakeWorker.instances).toHaveLength(2);
++    expect(oldWorker.terminated).toBe(true);
++    // The bug: `worker` was already pointing at the new instance by the time
++    // reset() terminated it, so the one about to be used was killed before its
++    // setup request went out.
++    expect(newWorker.terminated).toBe(false);
++    expect(newWorker.posted).toEqual([
++      expect.objectContaining({ type: "setup", hardwareID: expect.any(Uint8Array) }),
++    ]);
++
++    settle(newWorker, "ready");
++    await expect(second).resolves.toBeUndefined();
++    expect(useSapStore.getState().stage).toBe("ready");
++  });
++
++  it("reports the abandoned attempt rather than leaving it waiting", async () => {
++    const first = prepareSigner("cccccccccccc");
++    prepareSigner("dddddddddddd");
++
++    await expect(first).rejects.toThrow(/different device/);
++  });
++});
+diff --git a/frontend/tests/components/DiagnosticsModal.test.tsx b/frontend/tests/components/DiagnosticsModal.test.tsx
+index 0c32d17..3e73ff6 100644
+--- a/frontend/tests/components/DiagnosticsModal.test.tsx
++++ b/frontend/tests/components/DiagnosticsModal.test.tsx
+@@ -135,7 +135,9 @@ describe("DiagnosticsModal", () => {
+     // inside one long blocking call that cannot report from within. Nothing
+     // else on screen moves, so without a counter this is indistinguishable
+     // from a dead tab.
+-    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
++    // Through setSetup(), not by hand: the start of the count is state now, so
++    // a test that bypasses the setter would be testing a screen no user sees.
++    useSapStore.getState().setSetup();
+ 
+     vi.useFakeTimers();
+     try {
+@@ -165,7 +167,9 @@ describe("DiagnosticsModal", () => {
+   });
+ 
+   it("stops counting once the signer leaves the setup stage", () => {
+-    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
++    // Through setSetup(), not by hand: the start of the count is state now, so
++    // a test that bypasses the setter would be testing a screen no user sees.
++    useSapStore.getState().setSetup();
+ 
+     vi.useFakeTimers();
+     try {
+diff --git a/frontend/tests/components/SapStatus.test.tsx b/frontend/tests/components/SapStatus.test.tsx
+new file mode 100644
+index 0000000..11b5df9
+--- /dev/null
++++ b/frontend/tests/components/SapStatus.test.tsx
+@@ -0,0 +1,72 @@
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
++import { act, render } from "@testing-library/react";
++import SapStatus from "../../src/components/common/SapStatus";
++import { useSapStore } from "../../src/store/sap";
++
++// Interpolation options do not reach the screen through the repo's usual
++// t: (key) => key mock, and the elapsed seconds travel as one, so they are
++// rendered alongside the key here and read back out.
++vi.mock("react-i18next", () => ({
++  useTranslation: () => ({
++    t: (key: string, options?: Record<string, unknown>) =>
++      options ? `${key} ${JSON.stringify(options)}` : key,
++  }),
++}));
++
++const secondsIn = (text: string | null) =>
++  Number(/"seconds":(\d+)/.exec(text ?? "")![1]);
++
++describe("SapStatus during setup", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++    useSapStore.setState({
++      stage: "idle",
++      percent: null,
++      setupStartedAt: null,
++      error: null,
++      hardwareID: null,
++    });
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++  });
++
++  it("keeps counting from the real start when the screen unmounts and comes back", () => {
++    // Reported from the field: navigating to another page and back reset the
++    // count. The wait is many minutes long on a phone, so a clock that reads
++    // zero again describes a setup that just began when one is nine minutes in.
++    useSapStore.getState().setSetup();
++
++    const first = render(<SapStatus />);
++    act(() => {
++      vi.advanceTimersByTime(120_000);
++    });
++    expect(secondsIn(first.container.textContent)).toBe(120);
++    first.unmount();
++
++    const second = render(<SapStatus />);
++    expect(secondsIn(second.container.textContent)).toBe(120);
++
++    act(() => {
++      vi.advanceTimersByTime(5_000);
++    });
++    expect(secondsIn(second.container.textContent)).toBe(125);
++  });
++
++  it("does not carry the count over into a second setup", () => {
++    useSapStore.getState().setSetup();
++    const first = render(<SapStatus />);
++    act(() => {
++      vi.advanceTimersByTime(60_000);
++    });
++    expect(secondsIn(first.container.textContent)).toBe(60);
++
++    // A new attempt — the error path resets, then setup begins again.
++    act(() => {
++      useSapStore.getState().setError("boom");
++      useSapStore.getState().setSetup();
++    });
++    expect(secondsIn(first.container.textContent)).toBe(0);
++  });
++});
+diff --git a/frontend/tests/utils/diagnostics.test.ts b/frontend/tests/utils/diagnostics.test.ts
+index 50499dc..15e8b90 100644
+--- a/frontend/tests/utils/diagnostics.test.ts
++++ b/frontend/tests/utils/diagnostics.test.ts
+@@ -50,7 +50,13 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
+       progress: { stage: "locating", found: [] },
+       error: null,
+     },
+-    signer: { stage: "assets", percent: 42, error: null, hardwareID: "a1b2…" },
++    signer: {
++      stage: "assets",
++      percent: 42,
++      setupSeconds: null,
++      error: null,
++      hardwareID: "a1b2…",
++    },
+     accounts: [account],
+     language: "zh-CN",
+     now: new Date("2026-09-06T08:00:00.000Z"),
+@@ -58,6 +64,30 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
+   };
+ }
+ 
++it("reports how long setup has been running, because the stage name cannot", () => {
++  // Setup is the one stage with no percentage, and the only published timings
++  // for it are desktop and Node. A report saying stage: setup alone leaves
++  // "is it stuck?" unanswerable, which is exactly the question two field
++  // reports arrived asking.
++  const running = buildDiagnostics(
++    input({
++      signer: {
++        stage: "setup",
++        percent: null,
++        setupSeconds: 512,
++        error: null,
++        hardwareID: "a1b2…",
++      },
++    }),
++  );
++  expect(running).toContain("setupSeconds: 512");
++
++  // Outside the stage there is nothing to report, and 0 would read as
++  // "a setup that just began" rather than "no setup in progress".
++  const idle = buildDiagnostics(input());
++  expect(idle).toContain("setupSeconds: -");
++});
++
+ describe("masking", () => {
+   it("keeps enough of an email to tell accounts apart and no more", () => {
+     expect(maskEmail("richard@example.com")).toBe("r***@example.com");
+@@ -160,6 +190,7 @@ describe("buildDiagnostics", () => {
+         signer: {
+           stage: "error",
+           percent: null,
++          setupSeconds: null,
+           error: "timed out preparing the SAP signer",
+           hardwareID: "a1b2…",
+         },
+-- 
+2.39.5
+
