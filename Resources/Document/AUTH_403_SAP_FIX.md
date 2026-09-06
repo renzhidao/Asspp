@@ -400,7 +400,7 @@ SAP guest call exceeded 180s (elapsed 181.4s, 4200000 blocks,
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **147 passed / 22 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、4 个 guest 预算测试、4 个 guest 时限测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
+| 前端测试 | `frontend` `npm test` | **147 passed / 21 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、4 个 guest 预算测试、4 个 guest 时限测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
