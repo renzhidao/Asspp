@@ -113,8 +113,17 @@ export async function listVersions(
         typeof dict.customerMessage === "string" && dict.customerMessage
           ? dict.customerMessage
           : undefined;
+      // The download path carries the response body, which is how
+      // MZCommerce.ContentBanned came to light at all. This one did not, so the
+      // same refusal read as a bare "App Not Available" here and as a
+      // diagnosis over there — for one and the same answer from Apple.
+      const dialogId =
+        (dict.metrics as Record<string, any> | undefined)?.dialogId;
+      const dump = String(response.body ?? "").replace(/\s+/g, " ").slice(0, 400);
       throw new Error(
-        `${customerMessage ?? "No items in response"} (code=${code})`,
+        `${customerMessage ?? "No items in response"} (code=${code}` +
+          `${dialogId ? ` dialogId=${dialogId}` : ""} ` +
+          `endpoint=${requestHost}${requestPath.split("?")[0]} resp=${dump})`,
       );
     }
 

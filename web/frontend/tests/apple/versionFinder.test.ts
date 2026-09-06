@@ -64,7 +64,7 @@ describe("an empty failureType", () => {
     respond({ failureType: "", customerMessage: "App Not Available" });
 
     await expect(listVersions(account, app)).rejects.toThrow(
-      /App Not Available \(code=empty\)/,
+      /App Not Available \(code=empty/,
     );
   });
 
@@ -85,6 +85,62 @@ describe("the volumeStore payload", () => {
 
     expect(appleRequest.mock.calls[0][0].body).toContain(
       "<key>serialNumber</key>",
+    );
+  });
+});
+
+// The download path already carried the response body, which is the only reason
+// MZCommerce.ContentBanned was ever identified. Version history hit the same
+// wall and reported none of it.
+describe("the refusal reason", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("surfaces Apple's dialogId", async () => {
+    appleRequest.mockResolvedValue({
+      status: 200,
+      body: `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+    <key>metrics</key>
+    <dict>
+      <key>dialogId</key>
+      <string>MZCommerce.ContentBanned</string>
+      <key>message</key>
+      <string>App Not Available</string>
+    </dict>
+    <key>failureType</key>
+    <string></string>
+    <key>customerMessage</key>
+    <string>App Not Available</string>
+  </dict>
+</plist>`,
+      headers: {},
+      rawHeaders: [],
+    });
+
+    await expect(listVersions(account, app)).rejects.toThrow(
+      /dialogId=MZCommerce\.ContentBanned/,
+    );
+  });
+
+  it("names the endpoint that refused", async () => {
+    appleRequest.mockResolvedValue({
+      status: 200,
+      body: `<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+  <dict>
+    <key>failureType</key>
+    <string></string>
+    <key>customerMessage</key>
+    <string>App Not Available</string>
+  </dict>
+</plist>`,
+      headers: {},
+      rawHeaders: [],
+    });
+
+    await expect(listVersions(account, app)).rejects.toThrow(
+      /endpoint=[^ ]*volumeStoreDownloadProduct/,
     );
   });
 });

@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十五个 commit：
+二十六个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -649,6 +649,25 @@ cancel-purchase-batch`。`cancel-purchase-batch` 和 `m-allowed` 是**购买**�
 `0025` 不再猜：失败时把**整个交换**打印出来 —— 端点、HTTP 状态、实际发出的
 payload 键、以及响应原文（截断 600 字符）。失败响应里没有 `songList`，
 所以其中不含下载链接。
+
+**这就是找到根因的那一步。** 响应原文里有：
+
+```
+<key>dialogId</key><string>MZCommerce.ContentBanned</string>
+<key>failureType</key><string></string>
+```
+
+`0026` 把同样的证据接到历史版本上 —— 它此前只报 `App Not Available (code=empty)`，
+而同一个响应在下载那边是能读出 `ContentBanned` 的。
+
+### 版本历史与下载是同一个故障，不是两个
+
+两者走同一个端点、发同一个 payload。原作者的实现也是：
+`Sources/ApplePackage/Commands/VersionFinder.swift` 从同一个 volumeStore 响应里读
+`softwareVersionExternalIdentifiers`。ApplePackage 里**没有第二条**取版本历史的路
+（`softwareVersionExternalIdentifiers` 只在那一个文件命中）。
+
+所以被拒的应用，下载和版本历史一起没有；能下载的应用，两者都应该正常。
 
 ## 我验证到了什么（全部本次实跑）
 
