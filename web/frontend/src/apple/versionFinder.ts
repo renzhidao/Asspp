@@ -26,6 +26,13 @@ export async function listVersions(
       creditDisplay: "",
       guid: deviceId,
       salableAdamId: app.id,
+      // Apple added a verification check on the volumeStore endpoint that only
+      // some apps enforce — the big publishers do, ordinary ones do not, which
+      // is why a few apps have always failed here while the rest worked. The
+      // answer came back as "App Not Available" with an empty failureType, so
+      // nothing in the response said what was missing. ipatool hit the same
+      // wall and fixed it the same way (majd/ipatool#500, merged 2026-08-28).
+      serialNumber: "0",
     };
 
     const plistBody = buildPlist(payload);

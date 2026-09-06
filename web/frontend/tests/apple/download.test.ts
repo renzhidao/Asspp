@@ -90,3 +90,21 @@ describe("an empty failureType", () => {
     expect(error.message).toContain("failureType");
   });
 });
+
+// Apple only enforces the check on some apps, which is exactly the pattern in
+// the field: every ByteDance app failed, an ordinary one worked. Without the
+// key the endpoint answers "App Not Available" and an empty failureType, so
+// nothing in the response said what was missing.
+describe("the volumeStore payload", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("carries serialNumber", async () => {
+    respond({ failureType: "", customerMessage: "App Not Available" });
+
+    await getDownloadInfo(account, app).catch(() => {});
+
+    const sent = appleRequest.mock.calls[0][0];
+    expect(sent.body).toContain("<key>serialNumber</key>");
+    expect(sent.body).toContain("<string>0</string>");
+  });
+});

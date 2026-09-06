@@ -74,3 +74,17 @@ describe("an empty failureType", () => {
     await expect(listVersions(account, app)).rejects.toThrow(/code=absent/);
   });
 });
+
+describe("the volumeStore payload", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("carries serialNumber", async () => {
+    respond({ failureType: "", customerMessage: "App Not Available" });
+
+    await listVersions(account, app).catch(() => {});
+
+    expect(appleRequest.mock.calls[0][0].body).toContain(
+      "<key>serialNumber</key>",
+    );
+  });
+});

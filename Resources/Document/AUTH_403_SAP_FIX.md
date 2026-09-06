@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十三个 commit：
+二十四个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -592,6 +592,35 @@ versions  番茄小说  FAILED — No items in response
 数字码被丢掉 —— 前提错了，那三个改动对这个问题没有作用（虽然本身无害）。
 
 `0023` 把三态显式打出来：`code=9008` / `code=empty` / `code=absent`。
+
+## 根因：volumeStore 请求缺 `serialNumber`
+
+Apple 在 `volumeStoreDownloadProduct` 上加了一道校验，**只对部分应用生效** ——
+大厂的应用要，普通应用不要。ipatool 撞上同一堵墙：
+
+> Apple has recently implemented an additional verification check on the
+> volumeStoreDownloadProduct endpoint for certain popular applications (such as
+> Google and Microsoft apps, and others). If the required key is missing from
+> the payload, the API returns 5002. Other standard applications currently
+> bypass this check and work without issues.
+> — majd/ipatool#500
+
+修法是在 payload 里加 `serialNumber: "0"`。**该 PR 于 2026-08-28 合并** —— 和 SAP
+变更同一天。合并后 ipatool 在**三个** volumeStore 请求里都带这个键：
+`appstore_download.go`、`appstore_list_versions.go`、`appstore_get_version_metadata.go`。
+
+Web 版**一个都没有**。`grep -rn serialNumber src/` 在 `0023` 之前是 0 命中。
+
+这解释了全部现象：
+
+- 字节跳动那批应用全部失败，七猫小说成功 —— 正是「大厂要、普通不要」
+- 回的是 `App Not Available` 加空 `failureType`，响应里没有任何字段说明缺了什么
+- 下载、历史版本、版本元数据三处一起坏 —— 三个调用点都缺同一个键
+- 「这个项目从来就下载不了这些应用」—— 校验是 Apple 后加的，不是回归
+
+`0024` 给三处 payload 都加上 `serialNumber: "0"`。
+
+**这一条是上游已合并的修法，不是我猜的。**
 
 ## 我验证到了什么（全部本次实跑）
 
