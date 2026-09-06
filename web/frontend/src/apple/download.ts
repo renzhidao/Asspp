@@ -134,22 +134,29 @@ export async function getDownloadInfo(
 
     const songList = dict.songList as Record<string, any>[] | undefined;
     if (!songList || songList.length === 0) {
-      // Apple answered without a failureType and without an item. The answer
-      // is not empty — it says something about why there is nothing to give —
-      // and throwing it away turned every one of these into the same dead end.
-      // The storefront is the usual reason: the app is not licensable there.
-      const customerMessage = dict.customerMessage as string | undefined;
+      // Apple answered with no item. What it did send is the only evidence
+      // there is, so all of it goes out — including the fact that a field is
+      // empty, which is what turned out to be the interesting part here:
+      // failureType arrives as an empty string, and an empty string is falsy,
+      // so every check of the form `if (dict.failureType)` above silently
+      // stepped over it and every attempt to print the code printed nothing.
+      const customerMessage =
+        typeof dict.customerMessage === "string" && dict.customerMessage
+          ? dict.customerMessage
+          : undefined;
+      const code =
+        dict.failureType === undefined || dict.failureType === null
+          ? "absent"
+          : String(dict.failureType) === ""
+            ? "empty"
+            : String(dict.failureType);
       const keys = Object.keys(dict).filter((key) => key !== "dialog");
-      const evidence = [
-        customerMessage,
-        dict.failureType ? `code=${dict.failureType}` : "",
-        `store=${account.store}`,
-        `keys=${keys.join(",") || "none"}`,
-      ]
-        .filter(Boolean)
-        .join(" ");
       throw new DownloadError(
-        `${i18n.t("errors.download.noItems")} (${evidence})`,
+        `${customerMessage ?? i18n.t("errors.download.noItems")} ` +
+          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"})`,
+        typeof dict.failureType === "string" && dict.failureType
+          ? dict.failureType
+          : undefined,
       );
     }
 

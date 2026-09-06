@@ -67,3 +67,26 @@ describe("the volumeStore refusal", () => {
     expect(error.code).toBe("9008");
   });
 });
+
+// The response that actually arrives from the field: failureType present but
+// empty, customerMessage present. An empty string is falsy, so every
+// `if (dict.failureType)` check steps over it and the code never gets printed.
+describe("an empty failureType", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("is reported as empty, not silently omitted", async () => {
+    respond({
+      failureType: "",
+      customerMessage: "App Not Available",
+    });
+
+    const error = await getDownloadInfo(account, app).catch((e) => e);
+
+    expect(error).toBeInstanceOf(DownloadError);
+    expect(error.message).toContain("App Not Available");
+    expect(error.message).toContain("code=empty");
+    // The keys still list it, which is what made the old output look as though
+    // a code had been withheld rather than never sent.
+    expect(error.message).toContain("failureType");
+  });
+});

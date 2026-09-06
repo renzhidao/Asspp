@@ -94,7 +94,21 @@ export async function listVersions(
           }
         }
       }
-      throw new Error("No items in response");
+      // failureType is absent or empty here too — see download.ts. Print the
+      // distinction rather than a message that looks like the coded ones.
+      const code =
+        dict.failureType === undefined || dict.failureType === null
+          ? "absent"
+          : String(dict.failureType) === ""
+            ? "empty"
+            : String(dict.failureType);
+      const customerMessage =
+        typeof dict.customerMessage === "string" && dict.customerMessage
+          ? dict.customerMessage
+          : undefined;
+      throw new Error(
+        `${customerMessage ?? "No items in response"} (code=${code})`,
+      );
     }
 
     const item = songList[0];

@@ -56,3 +56,21 @@ describe("version history refusals", () => {
     );
   });
 });
+
+describe("an empty failureType", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("is reported as empty", async () => {
+    respond({ failureType: "", customerMessage: "App Not Available" });
+
+    await expect(listVersions(account, app)).rejects.toThrow(
+      /App Not Available \(code=empty\)/,
+    );
+  });
+
+  it("distinguishes absent from empty", async () => {
+    respond({ customerMessage: "App Not Available" });
+
+    await expect(listVersions(account, app)).rejects.toThrow(/code=absent/);
+  });
+});

@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十二个 commit：
+二十三个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -566,6 +566,32 @@ exchange.2         +130.5s  took  4.4s
 
 `0022` 两处都补：错误带上数字码，加载动作（成败、耗时、原因）进 `[activity]`，
 类型新增 `versions`。
+
+## failureType 是空字符串 —— 前面所有基于它的推断都错了
+
+`3085056` 部署后重试，两条错误都**没有数字码**，但都带 `customerMessage`：
+
+```
+download  番茄小说  FAILED — 响应中没有项目 (App Not Available store=143465
+          keys=pings,metrics,failureType,customerMessage,m-allowed,cancel-purchase-batch)
+versions  番茄小说  FAILED — No items in response
+```
+
+只有一种情况能同时满足「`keys` 里有 `failureType`」和「`code=` 没打印」：
+**`failureType` 是空字符串**。空串是 falsy，于是
+
+- `download.ts` 的 `if (dict.failureType)` 整块被跳过，落到 `noItems`
+- `versionFinder.ts` 同理，落到没有括号的那条 `throw new Error("No items in response")`
+- 所有 `dict.failureType ? ... : ""` 都打印了空
+
+`versions` 那条是决定性证据：`0022` 之后带码的三条都带括号，只有**走不到的**
+那条不带 —— 说明 `if (dict.failureType)` 根本没进。
+
+**所以 Apple 对这批应用回的是 `customerMessage="App Not Available"` 加一个空的
+`failureType`。** 没有数字码可给。此前 `0019`/`0020`/`0021` 三个补丁都假设有一个
+数字码被丢掉 —— 前提错了，那三个改动对这个问题没有作用（虽然本身无害）。
+
+`0023` 把三态显式打出来：`code=9008` / `code=empty` / `code=absent`。
 
 ## 我验证到了什么（全部本次实跑）
 
