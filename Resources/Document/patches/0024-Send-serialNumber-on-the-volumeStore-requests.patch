@@ -1,0 +1,186 @@
+From 245288f3889bf99554db3146149d596546c84761 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 17:43:07 +0000
+Subject: [PATCH] Send serialNumber on the volumeStore requests
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Apple added a verification check to volumeStoreDownloadProduct that only some
+apps enforce. The big publishers do, ordinary ones do not — which is the exact
+shape of what was failing here: every ByteDance app refused, an ordinary one
+worked, and the refusal came back as "App Not Available" with an empty
+failureType, so nothing in the response said what was missing.
+
+ipatool hit the same wall and fixed it by putting serialNumber: "0" in the
+payload (majd/ipatool#500, merged 2026-08-28 — the same day as the SAP change).
+It sends the key on all three volumeStore callers. This sent it on none.
+
+Added to download, version listing and version metadata.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts             |  7 ++++
+ frontend/src/apple/versionFinder.ts        |  7 ++++
+ frontend/src/apple/versionLookup.ts        |  7 ++++
+ frontend/tests/apple/download.test.ts      | 18 +++++++++
+ frontend/tests/apple/versionFinder.test.ts | 14 +++++++
+ frontend/tests/apple/versionLookup.test.ts | 44 ++++++++++++++++++++++
+ 6 files changed, 97 insertions(+)
+ create mode 100644 frontend/tests/apple/versionLookup.test.ts
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index d551904..96423af 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -38,6 +38,13 @@ export async function getDownloadInfo(
+       creditDisplay: "",
+       guid: deviceId,
+       salableAdamId: app.id,
++      // Apple added a verification check on the volumeStore endpoint that only
++      // some apps enforce — the big publishers do, ordinary ones do not, which
++      // is why a few apps have always failed here while the rest worked. The
++      // answer came back as "App Not Available" with an empty failureType, so
++      // nothing in the response said what was missing. ipatool hit the same
++      // wall and fixed it the same way (majd/ipatool#500, merged 2026-08-28).
++      serialNumber: "0",
+     };
+ 
+     if (externalVersionId) {
+diff --git a/frontend/src/apple/versionFinder.ts b/frontend/src/apple/versionFinder.ts
+index 52f921c..0e8ecba 100644
+--- a/frontend/src/apple/versionFinder.ts
++++ b/frontend/src/apple/versionFinder.ts
+@@ -26,6 +26,13 @@ export async function listVersions(
+       creditDisplay: "",
+       guid: deviceId,
+       salableAdamId: app.id,
++      // Apple added a verification check on the volumeStore endpoint that only
++      // some apps enforce — the big publishers do, ordinary ones do not, which
++      // is why a few apps have always failed here while the rest worked. The
++      // answer came back as "App Not Available" with an empty failureType, so
++      // nothing in the response said what was missing. ipatool hit the same
++      // wall and fixed it the same way (majd/ipatool#500, merged 2026-08-28).
++      serialNumber: "0",
+     };
+ 
+     const plistBody = buildPlist(payload);
+diff --git a/frontend/src/apple/versionLookup.ts b/frontend/src/apple/versionLookup.ts
+index 6f4e8c4..697cbe7 100644
+--- a/frontend/src/apple/versionLookup.ts
++++ b/frontend/src/apple/versionLookup.ts
+@@ -31,6 +31,13 @@ export async function getVersionMetadata(
+       guid: deviceId,
+       salableAdamId: app.id,
+       [endpoint.externalVersionIdKey]: versionId,
++      // Apple added a verification check on the volumeStore endpoint that only
++      // some apps enforce — the big publishers do, ordinary ones do not, which
++      // is why a few apps have always failed here while the rest worked. The
++      // answer came back as "App Not Available" with an empty failureType, so
++      // nothing in the response said what was missing. ipatool hit the same
++      // wall and fixed it the same way (majd/ipatool#500, merged 2026-08-28).
++      serialNumber: "0",
+     };
+ 
+     const plistBody = buildPlist(payload);
+diff --git a/frontend/tests/apple/download.test.ts b/frontend/tests/apple/download.test.ts
+index 067b5ed..47730b4 100644
+--- a/frontend/tests/apple/download.test.ts
++++ b/frontend/tests/apple/download.test.ts
+@@ -90,3 +90,21 @@ describe("an empty failureType", () => {
+     expect(error.message).toContain("failureType");
+   });
+ });
++
++// Apple only enforces the check on some apps, which is exactly the pattern in
++// the field: every ByteDance app failed, an ordinary one worked. Without the
++// key the endpoint answers "App Not Available" and an empty failureType, so
++// nothing in the response said what was missing.
++describe("the volumeStore payload", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("carries serialNumber", async () => {
++    respond({ failureType: "", customerMessage: "App Not Available" });
++
++    await getDownloadInfo(account, app).catch(() => {});
++
++    const sent = appleRequest.mock.calls[0][0];
++    expect(sent.body).toContain("<key>serialNumber</key>");
++    expect(sent.body).toContain("<string>0</string>");
++  });
++});
+diff --git a/frontend/tests/apple/versionFinder.test.ts b/frontend/tests/apple/versionFinder.test.ts
+index 818d9fe..0fae1a3 100644
+--- a/frontend/tests/apple/versionFinder.test.ts
++++ b/frontend/tests/apple/versionFinder.test.ts
+@@ -74,3 +74,17 @@ describe("an empty failureType", () => {
+     await expect(listVersions(account, app)).rejects.toThrow(/code=absent/);
+   });
+ });
++
++describe("the volumeStore payload", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("carries serialNumber", async () => {
++    respond({ failureType: "", customerMessage: "App Not Available" });
++
++    await listVersions(account, app).catch(() => {});
++
++    expect(appleRequest.mock.calls[0][0].body).toContain(
++      "<key>serialNumber</key>",
++    );
++  });
++});
+diff --git a/frontend/tests/apple/versionLookup.test.ts b/frontend/tests/apple/versionLookup.test.ts
+new file mode 100644
+index 0000000..97fe6a4
+--- /dev/null
++++ b/frontend/tests/apple/versionLookup.test.ts
+@@ -0,0 +1,44 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++// The third volumeStore caller. ipatool sends serialNumber on all three; the
++// check is per app, not per caller, so missing it anywhere reproduces the same
++// "App Not Available" with an empty failureType.
++
++const appleRequest = vi.hoisted(() => vi.fn());
++
++vi.mock("../../src/apple/request", () => ({ appleRequest }));
++
++const mod = await import("../../src/apple/versionLookup");
++const fn = Object.values(mod).find((v) => typeof v === "function") as (
++  ...args: unknown[]
++) => Promise<unknown>;
++
++const account = {
++  email: "a@example.com",
++  directoryServicesIdentifier: "d",
++  store: "143465",
++  cookies: [],
++  deviceIdentifier: "8a85f3e21c9d",
++} as never;
++
++const app = { id: "1468454200", name: "番茄小说" } as never;
++
++describe("the version metadata payload", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("carries serialNumber", async () => {
++    appleRequest.mockResolvedValue({
++      status: 200,
++      body: `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n  <dict>\n    <key>failureType</key>\n    <string></string>\n  </dict>\n</plist>`,
++      headers: {},
++      rawHeaders: [],
++    });
++
++    await fn(account, app, "123").catch(() => {});
++
++    expect(appleRequest).toHaveBeenCalled();
++    expect(appleRequest.mock.calls[0][0].body).toContain(
++      "<key>serialNumber</key>",
++    );
++  });
++});
+-- 
+2.39.5
+
