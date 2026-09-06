@@ -82,6 +82,8 @@ export interface GuestRunStats {
   steps: number;
   /** Blocks the decoder could not read. */
   measureFailures: number;
+  /** Blocks whose layout came from the cache rather than a fresh decode. */
+  measureHits: number;
   /** Instructions handed to the emulator without splitting help. */
   unassisted: number;
   /** Remaining instruction budget. */
@@ -108,9 +110,50 @@ export function describeGuestRun(stats: GuestRunStats): string {
     `elapsed ${(stats.elapsedMs / 1000).toFixed(1)}s, ` +
     `${stats.steps} blocks, ` +
     `${stats.measureFailures} undecodable, ` +
+    `${stats.measureHits} cached blocks, ` +
     `${stats.unassisted} unassisted instructions, ` +
     `budget left ${stats.budget}`
   );
+}
+
+/**
+ * Remembers how a block at an address measured, for the length of one run.
+ *
+ * The error that identified the cost read `1003147 blocks` against a budget
+ * that had barely moved — a million turns of the loop for fifteen million
+ * instructions, about fifteen instructions a block, each paying a fresh
+ * 480-byte read and decode. Guest code loops, so the same blocks come back
+ * around and were being measured over and over.
+ *
+ * Valid for one run only, and safe because segment() plants its HLT and puts
+ * the original byte back inside the same call, so measure() always sees
+ * unmodified memory. Between runs the guest may have written to itself, so
+ * run() starts from an empty cache.
+ */
+export class BlockCache {
+  private readonly entries = new Map<string, Block | null>();
+
+  constructor(private readonly limit: number = 1 << 16) {}
+
+  get(address: bigint): Block | null | undefined {
+    const hit = this.entries.get(address.toString(16));
+    return hit === undefined ? undefined : hit;
+  }
+
+  /** A full cache is emptied rather than evicted one at a time: it is a hint,
+   * and a wrong hint would be worse than a miss. */
+  set(address: bigint, block: Block | null): void {
+    if (this.entries.size >= this.limit) this.entries.clear();
+    this.entries.set(address.toString(16), block);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
 }
 
 export function unassistedAllowance(
@@ -446,6 +489,8 @@ export class Machine {
     const startedAt = Date.now();
     let steps = 0;
     let measureFailures = 0;
+    let measureHits = 0;
+    const cache = new BlockCache();
 
     while (budget > 0) {
       // Checked once per block rather than per instruction: the block loop is
@@ -459,13 +504,22 @@ export class Machine {
               elapsedMs: Date.now() - startedAt,
               steps,
               measureFailures,
+              measureHits,
               unassisted: this.unassisted,
               budget,
             })})`,
         );
       }
 
-      const block = this.measure(address);
+      const cached = cache.get(address);
+      let block: Block | null;
+      if (cached === undefined) {
+        block = this.measure(address);
+        cache.set(address, block);
+      } else {
+        block = cached;
+        measureHits++;
+      }
 
       if (!block) {
         measureFailures++;
