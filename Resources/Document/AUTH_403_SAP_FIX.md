@@ -8,10 +8,10 @@
 
 | 路径 | 内容 |
 | --- | --- |
-| `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 5 个 commit，168 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 5 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
+| `Resources/Document/patches/` | 同样 6 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-五个 commit：
+六个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -19,6 +19,7 @@
 0003 Sign the authenticate request, off the main thread        ← 上游 PR #88（含冲突解决）
 0004 Make SAP assets suppliable without Apple's CDN; test the SAP routes  ← 本次新增
 0005 Add a diagnostics report that needs no console            ← 本次新增
+0006 Report SAP asset progress honestly                        ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -164,6 +165,20 @@ note: contains no password, passwordToken, cookie or DSID by construction.
   - s***@other.org  store=143462  hasPassword=no  guid=ffee…
 ```
 
+## `stage: assets, percent: 100` 是显示错误，不是卡死
+
+第一份真实部署的诊断报告里出现了这个组合，看着像「卡在 100%」，其实不是。
+
+四个二进制是 `Promise.all` **并发**下载的，体积差两个数量级
+（CommerceCore 207 KB / CommerceKit 3.3 MB / CoreFP.icxs 5.3 MB / CoreFP 29 MB），
+而进度上报的是**最后到达的那条消息所属单个文件**的 `loaded/total`。
+所以 207 KB 那个一落地就报 100%，而 29 MB 的 CoreFP 才刚开始 —— 真正的等待还在后面。
+`0006` 改成先 HEAD 量出总大小，再上报「已到手字节 / 应到手字节」这一个数字。
+
+另外服务端从 Apple 拉取那一段，原本也往同一个通道里塞 `loaded=已找到文件数/total=4`，
+被当成字节百分比读 —— 于是**一个字节都还没下载就显示 100%**。现在它有独立的
+`installing` 阶段，不给百分比，因为那时候没有诚实的百分比可给。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -171,14 +186,15 @@ note: contains no password, passwordToken, cookie or DSID by construction.
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **115 passed / 14 files**（基线 96；新增 3 个签名测试、13 个诊断构建测试、3 个诊断弹窗渲染测试） |
+| 前端测试 | `frontend` `npm test` | **121 passed / 15 files**（基线 96；新增 3 个签名测试、13 个诊断构建测试、4 个诊断弹窗渲染测试、5 个进度语义测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **五个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **六个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 进度修复真抓得住 bug | 把累加逻辑还原成旧写法再跑测试 | 3 个失败，其中 `expected 100 to be less than 50` —— 正是日志里那个 100% |
 | 诊断按钮真渲染 | 组件测试 + 打印真实输出 | 弹窗渲染、两个接口都被调用、剪贴板收到内容、且内容不含凭据 |
 
 新增测试覆盖的具体行为（都是断言真实代码路径，不是 stand-in）：
