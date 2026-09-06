@@ -1,0 +1,295 @@
+From 98148c94ea753fab2b236ce9e6f2b1522926afd7 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 11:19:16 +0000
+Subject: [PATCH] Show elapsed time while the signer is being set up
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A second report from the field came back at stage: setup with no percentage,
+and the screen had said "setting up the signer, this takes about a minute" —
+one static line, for the longest wait in the whole flow. That is
+indistinguishable from a dead tab.
+
+It is not a stall. The worker posts phase:setup before Signer.create() and then
+enters one blocking call — Machine.open, initialize, two exchange rounds — from
+inside which it cannot report at all. The client's own timeout is 15 minutes, so
+for up to 15 minutes the line neither changes nor errors.
+
+There is no honest percentage to invent for it, so it counts up instead: the
+seconds move every second, which is the only available evidence that the worker
+is still alive. The wording stops promising a minute, since the only
+measurements that exist are WebKit 35 s, Node 63 s and desktop Chrome 115 s —
+and the reports come from real phones, where none of those apply.
+
+Also fixes the toast mock in DiagnosticsModal.test.tsx, which replaced the store
+with a function returning the state instead of calling the selector, so addToast
+was not a function and every run left an unhandled rejection behind the tests.
+
+Verified by removing the timer and watching both new tests fail.
+---
+ frontend/src/components/common/SapStatus.tsx  | 28 +++++-
+ frontend/src/locales/en-US.json               |  3 +-
+ frontend/src/locales/ja.json                  |  3 +-
+ frontend/src/locales/ko.json                  |  3 +-
+ frontend/src/locales/ru.json                  |  3 +-
+ frontend/src/locales/zh-CN.json               |  3 +-
+ frontend/src/locales/zh-TW.json               |  3 +-
+ .../components/DiagnosticsModal.test.tsx      | 92 ++++++++++++++++++-
+ 8 files changed, 126 insertions(+), 12 deletions(-)
+
+diff --git a/frontend/src/components/common/SapStatus.tsx b/frontend/src/components/common/SapStatus.tsx
+index 5618216..3eae054 100644
+--- a/frontend/src/components/common/SapStatus.tsx
++++ b/frontend/src/components/common/SapStatus.tsx
+@@ -1,3 +1,4 @@
++import { useEffect, useState } from "react";
+ import { useTranslation } from "react-i18next";
+ import { useSapStore } from "../../store/sap";
+ 
+@@ -20,6 +21,28 @@ export default function SapStatus() {
+   const percent = useSapStore((state) => state.percent);
+   const error = useSapStore((state) => state.error);
+ 
++  // Setting a signer up is a long, single-threaded wait inside the worker, and
++  // the worker cannot report from inside it — so from outside it is
++  // indistinguishable from a dead tab. The download and install phases have
++  // real numbers to show; this one has none, so it counts up instead. A number
++  // that moves is the only honest "still working" available here, and the wait
++  // is long enough that a fixed estimate reads as a hang once it is passed.
++  const [elapsed, setElapsed] = useState(0);
++
++  useEffect(() => {
++    if (stage !== "setup") {
++      setElapsed(0);
++      return;
++    }
++
++    const startedAt = Date.now();
++    const timer = setInterval(
++      () => setElapsed(Math.round((Date.now() - startedAt) / 1000)),
++      1000,
++    );
++    return () => clearInterval(timer);
++  }, [stage]);
++
+   if (stage === "idle" || stage === "ready") return null;
+ 
+   if (stage === "error") {
+@@ -36,7 +59,10 @@ export default function SapStatus() {
+         ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
+         : stage === "installing"
+           ? t("accounts.addForm.installingAssets")
+-          : t("accounts.addForm.preparingSigner")}
++          : `${t("accounts.addForm.preparingSigner")} ${t(
++              "accounts.addForm.setupElapsed",
++              { seconds: elapsed },
++            )}`}
+     </span>
+   );
+ }
+diff --git a/frontend/src/locales/en-US.json b/frontend/src/locales/en-US.json
+index 03f50f8..3d28e54 100644
+--- a/frontend/src/locales/en-US.json
++++ b/frontend/src/locales/en-US.json
+@@ -112,7 +112,8 @@
+       "signIn": "Sign In",
+       "installingAssets": "The server is downloading the signing components from Apple (38 MB); this takes a few minutes on a first deployment…",
+       "preparingAssets": "Preparing signing components {{percent}}%",
+-      "preparingSigner": "Setting up the signer, this takes about a minute…",
++      "preparingSigner": "Initialising the signer (about a minute first time, noticeably longer on a phone)…",
++      "setupElapsed": "waiting {{seconds}}s",
+       "signingRequest": "Signing the request…",
+       "signerFailed": "Could not prepare the signer: {{error}}",
+       "verify": "Verify",
+diff --git a/frontend/src/locales/ja.json b/frontend/src/locales/ja.json
+index 0d6a1b1..dff6a2d 100644
+--- a/frontend/src/locales/ja.json
++++ b/frontend/src/locales/ja.json
+@@ -112,7 +112,8 @@
+       "signIn": "サインイン",
+       "installingAssets": "サーバーが Apple から署名コンポーネント（38 MB）をダウンロードしています。初回展開では数分かかります…",
+       "preparingAssets": "署名コンポーネントを準備中 {{percent}}%",
+-      "preparingSigner": "署名機能を初期化しています。1分ほどかかります…",
++      "preparingSigner": "署名器を初期化しています（初回は約1分、スマートフォンではさらに時間がかかります）…",
++      "setupElapsed": "待機時間 {{seconds}} 秒",
+       "signingRequest": "リクエストに署名しています…",
+       "signerFailed": "署名コンポーネントを準備できませんでした: {{error}}",
+       "verify": "確認",
+diff --git a/frontend/src/locales/ko.json b/frontend/src/locales/ko.json
+index 5bc6088..4ebfc45 100644
+--- a/frontend/src/locales/ko.json
++++ b/frontend/src/locales/ko.json
+@@ -112,7 +112,8 @@
+       "signIn": "로그인",
+       "installingAssets": "서버가 Apple에서 서명 구성 요소(38 MB)를 내려받는 중입니다. 첫 배포에서는 몇 분 걸립니다…",
+       "preparingAssets": "서명 구성요소 준비 중 {{percent}}%",
+-      "preparingSigner": "서명기를 초기화하는 중입니다. 1분 정도 걸립니다…",
++      "preparingSigner": "서명기를 초기화하는 중입니다(첫 회 약 1분, 모바일에서는 더 오래 걸립니다)…",
++      "setupElapsed": "{{seconds}}초 대기 중",
+       "signingRequest": "요청에 서명하는 중…",
+       "signerFailed": "서명 구성요소를 준비하지 못했습니다: {{error}}",
+       "verify": "확인",
+diff --git a/frontend/src/locales/ru.json b/frontend/src/locales/ru.json
+index d2f72d4..58df7fe 100644
+--- a/frontend/src/locales/ru.json
++++ b/frontend/src/locales/ru.json
+@@ -112,7 +112,8 @@
+       "signIn": "Войти",
+       "installingAssets": "Сервер загружает компоненты подписи с Apple (38 МБ); при первом развёртывании это занимает несколько минут…",
+       "preparingAssets": "Подготовка компонентов подписи {{percent}}%",
+-      "preparingSigner": "Инициализация подписи, это занимает около минуты…",
++      "preparingSigner": "Инициализация подписанта (в первый раз около минуты, на телефоне заметно дольше)…",
++      "setupElapsed": "ожидание {{seconds}} с",
+       "signingRequest": "Подписывание запроса…",
+       "signerFailed": "Не удалось подготовить подпись: {{error}}",
+       "verify": "Проверить",
+diff --git a/frontend/src/locales/zh-CN.json b/frontend/src/locales/zh-CN.json
+index e767302..60e71ca 100644
+--- a/frontend/src/locales/zh-CN.json
++++ b/frontend/src/locales/zh-CN.json
+@@ -112,7 +112,8 @@
+       "signIn": "登录",
+       "installingAssets": "服务器正在从 Apple 下载签名组件（38 MB），首次部署需要几分钟…",
+       "preparingAssets": "正在准备签名组件 {{percent}}%",
+-      "preparingSigner": "正在初始化签名器，约需一分钟…",
++      "preparingSigner": "正在初始化签名器（首次约 1 分钟，手机上会明显更久）…",
++      "setupElapsed": "已等待 {{seconds}} 秒",
+       "signingRequest": "正在签名请求…",
+       "signerFailed": "签名组件准备失败：{{error}}",
+       "verify": "验证",
+diff --git a/frontend/src/locales/zh-TW.json b/frontend/src/locales/zh-TW.json
+index 4511808..fd295b6 100644
+--- a/frontend/src/locales/zh-TW.json
++++ b/frontend/src/locales/zh-TW.json
+@@ -112,7 +112,8 @@
+       "signIn": "登入",
+       "installingAssets": "伺服器正在從 Apple 下載簽章元件（38 MB），首次部署需要幾分鐘…",
+       "preparingAssets": "正在準備簽名元件 {{percent}}%",
+-      "preparingSigner": "正在初始化簽名器，約需一分鐘…",
++      "preparingSigner": "正在初始化簽章器（首次約 1 分鐘，手機上會明顯更久）…",
++      "setupElapsed": "已等待 {{seconds}} 秒",
+       "signingRequest": "正在簽署請求…",
+       "signerFailed": "簽名元件準備失敗：{{error}}",
+       "verify": "驗證",
+diff --git a/frontend/tests/components/DiagnosticsModal.test.tsx b/frontend/tests/components/DiagnosticsModal.test.tsx
+index 3f0bd6b..0c32d17 100644
+--- a/frontend/tests/components/DiagnosticsModal.test.tsx
++++ b/frontend/tests/components/DiagnosticsModal.test.tsx
+@@ -1,19 +1,37 @@
+ import { describe, it, expect, vi, beforeEach } from "vitest";
+-import { render, screen, waitFor } from "@testing-library/react";
++import { act, render, screen, waitFor } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
+ import DiagnosticsModal from "../../src/components/Settings/DiagnosticsModal";
++import SapStatus from "../../src/components/common/SapStatus";
+ import { apiGet } from "../../src/api/client";
+ import { useAccountsStore } from "../../src/store/accounts";
+ import { useSapStore } from "../../src/store/sap";
+ import type { Account } from "../../src/types";
+ 
+ vi.mock("../../src/api/client", () => ({ apiGet: vi.fn() }));
+-vi.mock("../../src/store/toast", () => ({
+-  useToastStore: Object.assign(vi.fn(() => ({ addToast: vi.fn() })), {
+-    // The component reads the store via a selector.
+-    ...{},
++
++// The repo's usual mock is `t: (key) => key`, which drops interpolation
++// options. SapStatus passes the elapsed seconds as one, and a timer whose
++// number never reaches the screen is the exact thing being tested, so this
++// mock renders the options alongside the key and the assertions read them back.
++vi.mock("react-i18next", () => ({
++  useTranslation: () => ({
++    // DiagnosticsModal reads i18n.language for the report's [browser] section.
++    i18n: { language: "en-US" },
++    t: (key: string, options?: Record<string, unknown>) =>
++      options ? `${key} ${JSON.stringify(options)}` : key,
+   }),
+ }));
++// The component reads this store through a selector —
++// useToastStore((state) => state.addToast) — so the mock has to call the
++// selector with a state, not hand back the state itself. Returning the state
++// directly makes addToast a non-function, and the failure only surfaces in the
++// copy's catch branch, as an unhandled rejection that outlives the test.
++const addToast = vi.fn();
++vi.mock("../../src/store/toast", () => ({
++  useToastStore: (selector: (state: any) => any) =>
++    selector({ addToast: (...args: unknown[]) => addToast(...args) }),
++}));
+ 
+ const SECRET = "password-that-must-not-appear";
+ 
+@@ -106,6 +124,70 @@ describe("DiagnosticsModal", () => {
+     const { container } = render(<SapStatus />);
+ 
+     expect(container.textContent).toBe("accounts.addForm.installingAssets");
++    // No percentage is invented for a fetch whose size the browser never
++    // sees, and no seconds are counted for one the browser is not waiting on.
++    expect(container.textContent).not.toMatch(/\d/);
++    expect(container.textContent).not.toContain("setupElapsed");
++  });
++
++  it("counts up while the signer is being set up, so the wait is visibly alive", () => {
++    // The stage from a real field report: assets are in hand, and the worker is
++    // inside one long blocking call that cannot report from within. Nothing
++    // else on screen moves, so without a counter this is indistinguishable
++    // from a dead tab.
++    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
++
++    vi.useFakeTimers();
++    try {
++      const { container } = render(<SapStatus />);
++      expect(container.textContent).toContain("accounts.addForm.preparingSigner");
++
++      // The seconds travel to t() as interpolation data, so read them back out
++      // of the component's own rendering rather than assuming a format.
++      const seconds = () =>
++        Number(/"seconds":(\d+)/.exec(container.textContent!)![1]);
++
++      expect(container.textContent).toContain("accounts.addForm.setupElapsed");
++      expect(seconds()).toBe(0);
++
++      act(() => {
++        vi.advanceTimersByTime(3000);
++      });
++      expect(seconds()).toBe(3);
++
++      act(() => {
++        vi.advanceTimersByTime(9000);
++      });
++      expect(seconds()).toBe(12);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("stops counting once the signer leaves the setup stage", () => {
++    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
++
++    vi.useFakeTimers();
++    try {
++      const { container } = render(<SapStatus />);
++      act(() => {
++        vi.advanceTimersByTime(5000);
++      });
++      expect(container.textContent).toContain('"seconds":5');
++
++      act(() => {
++        useSapStore.setState({ stage: "ready", percent: null } as any);
++      });
++      // Renders nothing once ready — and the interval must be gone with it.
++      expect(container.textContent).toBe("");
++
++      act(() => {
++        vi.advanceTimersByTime(5000);
++      });
++      expect(container.textContent).toBe("");
++    } finally {
++      vi.useRealTimers();
++    }
+   });
+ 
+   it("copies the report to the clipboard on request", async () => {
+-- 
+2.39.5
+
