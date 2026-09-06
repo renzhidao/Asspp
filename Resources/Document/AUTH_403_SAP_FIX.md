@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十六个 commit：
+十七个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -459,6 +459,22 @@ const renewed = await authenticate(
 
 签名器**无法**跨刷新保存：它是 unicorn.js 里一台跑着的仿真机，状态就是那块仿真内存。
 能做的是让它自动重建，而不是等需要它的那次点击。
+
+## 获取许可证和下载都不该要签名
+
+`acquireLicense()` 每次都先无条件重新登录，注释写的是「防止 token 过期（2034/2042）」。
+但 `authenticate()` 的第一步就是 `prepareSigner()`，于是这个防御性刷新让每次点击都付
+一整轮 SAP setup —— 已测设备上要好几分钟。
+
+`purchaseApp()` 实际只读 `passwordToken`、`directoryServicesIdentifier`、`store`、
+`cookies`、`deviceIdentifier`，**登录后全都有**。所以改成先用现有 token 买，
+只有 Apple 真的回 `2034`/`2042` 才重新登录。
+
+下载同理：`getDownloadInfo()` 收到 `failureType 9610` 就是「还没有许可证」
+（`download.ts:106`）。获取许可证不需要签名，所以直接自动获取再重试，
+不必让用户先点另一个按钮。
+
+`0017`。
 
 ## 我验证到了什么（全部本次实跑）
 

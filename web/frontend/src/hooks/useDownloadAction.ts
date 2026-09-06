@@ -2,8 +2,8 @@ import { useTranslation } from "react-i18next";
 import { useAccounts } from "./useAccounts";
 import { useToastStore } from "../store/toast";
 import { useDownloadsStore } from "../store/downloads";
-import { getDownloadInfo } from "../apple/download";
-import { purchaseApp } from "../apple/purchase";
+import { getDownloadInfo, DownloadError } from "../apple/download";
+import { purchaseApp, PurchaseError } from "../apple/purchase";
 import { authenticate } from "../apple/authenticate";
 import { apiPost, apiGet } from "../api/client";
 import { accountHash } from "../utils/account";
@@ -50,13 +50,24 @@ export function useDownloadAction() {
       // Settings fetch failed — backend will still enforce the limit
     }
 
-    const { output, updatedCookies } = await getDownloadInfo(
-      account,
+    let licenseAccount = account;
+    let { output, updatedCookies } = await getDownloadInfo(
+      licenseAccount,
       app,
       versionId,
-    );
-    await updateAccount({ ...account, cookies: updatedCookies });
-    const hash = await accountHash(account);
+    ).catch(async (error: unknown) => {
+      // 9610 is Apple saying the account has no licence for this app yet.
+      // Acquiring one needs no signature — only the passwordToken and cookies
+      // already on the account — so get it and carry on instead of making the
+      // click the thing that has to happen first.
+      if (!(error instanceof DownloadError) || error.code !== "9610") throw error;
+      const licensed = await purchaseApp(licenseAccount, app);
+      licenseAccount = { ...licenseAccount, cookies: licensed.updatedCookies };
+      await updateAccount(licenseAccount);
+      return getDownloadInfo(licenseAccount, app, versionId);
+    });
+    await updateAccount({ ...licenseAccount, cookies: updatedCookies });
+    const hash = await accountHash(licenseAccount);
 
     await apiPost("/api/downloads", {
       software: { ...app, version: output.bundleShortVersionString },
@@ -79,11 +90,23 @@ export function useDownloadAction() {
     const ctx = getAccountContext(account, t);
     const appName = app.name;
 
-    // Silently renew the password token before purchasing.
-    // This prevents "token expired" (2034/2042) errors that would
-    // otherwise require the user to manually re-authenticate.
+    // Renewing the token used to happen first, unconditionally. authenticate()
+    // begins with prepareSigner(), and the signer lives in worker memory, so
+    // that defensive refresh cost a whole SAP setup on every click — several
+    // minutes on the devices that have been measured. The purchase only needs
+    // the passwordToken and cookies already on the account, so try it with
+    // those and sign in again only once Apple says the token has expired.
     let currentAccount = account;
+    let result: Awaited<ReturnType<typeof purchaseApp>>;
+
     try {
+      result = await purchaseApp(currentAccount, app);
+    } catch (error) {
+      const expired =
+        error instanceof PurchaseError &&
+        (error.code === "2034" || error.code === "2042");
+      if (!expired) throw error;
+
       const renewed = await authenticate(
         account.email,
         account.password,
@@ -93,11 +116,9 @@ export function useDownloadAction() {
       );
       await updateAccount(renewed);
       currentAccount = renewed;
-    } catch {
-      // Ignore — proceed with existing token
+      result = await purchaseApp(currentAccount, app);
     }
 
-    const result = await purchaseApp(currentAccount, app);
     await updateAccount({ ...currentAccount, cookies: result.updatedCookies });
 
     addToast(
