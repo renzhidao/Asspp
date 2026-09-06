@@ -1,0 +1,873 @@
+From 4919804e34ebd74b061b35d0171a8873166c9db0 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 08:39:26 +0000
+Subject: [PATCH 4/5] Make SAP assets suppliable without Apple's CDN; test the
+ SAP routes
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Three things the upstream draft did not have.
+
+SAP_ASSETS_DIR points the signer at a directory the operator fills in, for
+deployments whose egress never reaches swcdn.apple.com — a Space behind a
+filter, a host in a region where Apple's CDN is unreliable. Without it the
+only path to a working sign-in was a download that could not happen.
+
+sap-assets.json alongside the binaries overrides the built-in asset list. It
+is what makes the manual path verifiable rather than hopeful, and it is how a
+deployment points the signer at a different build of those binaries.
+
+A fetch that cannot connect now says so. Node collapses every failure into
+"fetch failed" with the reason on .cause; unwrapped, an operator got two
+useless words and no hint that another path existed.
+
+Also covers the routes and the verification with tests — 19 of them, offline,
+using stand-in files described by a manifest rather than 38 MB of Apple's
+binaries — and fixes SapStatus eating a track of ProductDetail's action grid.
+---
+ .gitignore                                    |   3 +
+ README.md                                     |  43 +++
+ backend/src/config.ts                         |   4 +
+ backend/src/routes/sap.ts                     |   4 +-
+ backend/src/services/sapAssets.ts             | 140 +++++++-
+ backend/tests/sapRoute.test.ts                | 308 ++++++++++++++++++
+ .../src/components/Search/ProductDetail.tsx   |   4 +-
+ frontend/src/components/common/SapStatus.tsx  |   9 +-
+ frontend/tests/apple/authenticate.test.ts     | 119 ++++++-
+ 9 files changed, 600 insertions(+), 34 deletions(-)
+ create mode 100644 backend/tests/sapRoute.test.ts
+
+diff --git a/.gitignore b/.gitignore
+index 4261653..e130005 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -137,3 +137,6 @@ references/
+ mnt/
+ tunnel/
+ deploy.sh
++
++# Built frontend, copied in by the Docker build
++backend/public/
+diff --git a/README.md b/README.md
+index 18e0b30..c2ef109 100644
+--- a/README.md
++++ b/README.md
+@@ -76,6 +76,7 @@ docker compose up -d
+ | `MAX_DOWNLOAD_MB`                           | `0`             | Reject downloads exceeding this size in MB to prevent out-of-memory errors (0 to disable)   |
+ | `DOWNLOAD_THREADS`                          | `8`             | Number of parallel threads for IPA downloads (1–32)                                         |
+ | `ACCESS_PASSWORD`                           | _(none)_        | Require a password to access the web UI and API (empty to disable)                          |
++| `SAP_ASSETS_DIR`                            | _(DATA_DIR/sap)_ | Where the SAP signer's Apple binaries live. Set it when the host cannot reach `swcdn.apple.com` and the files must be supplied by hand — point it at a persistent volume, or they vanish on every restart |
+ 
+ **Reverse Proxy (Required for Install Apps on iOS)**
+ 
+@@ -95,6 +96,48 @@ AssppWeb relies on the Wisp protocol over WebSocket (`/wisp/`) for its zero-trus
+ 
+ </details>
+ 
++## Sign-in and the SAP signature
++
++Since August 2026 Apple rejects an `authenticate` request that carries no
++`X-Apple-ActionSignature` with **HTTP 403 and an empty body**, before it looks
++at the credentials. The live bag lists the affected endpoints under
++`urlBag.sign-sap-request`. The UI reports this as
++`认证失败：服务器返回 HTTP 403 且响应体为空` / "Authentication failed: server returned
++HTTP 403 with an empty body".
++
++Signing means running Apple's own signing code, so this build emulates the four
++binaries from a 2013 OS X release in the browser, under
++[unicorn.js](https://github.com/alexaltea/unicorn.js), inside a Web Worker:
++
++- `POST /api/sap/assets/fetch` downloads them from Apple's software update CDN
++  on first use and keeps them in `SAP_ASSETS_DIR`. `GET /api/sap/assets` reports
++  which are present and verified — poll that rather than watching the server log.
++- `GET /api/sap/certificate` and `POST /api/sap/setup` proxy the two SAP setup
++  endpoints. Neither carries credentials; the only identity in the handshake is
++  the device guid the client already sends in the clear, so the server still
++  never sees an Apple password.
++
++**Cost, so it is not a surprise:** setup runs about ten million emulated
++instructions — roughly 35 s on WebKit and 115 s on Chrome — and each signature a
++few million more. Setup starts in the background as soon as there is an account
++to bind a signer to, and the button reports progress meanwhile. On a phone,
++expect it to be slow and expect the memory to matter.
++
++### When the host cannot reach Apple's CDN
++
++`swcdn.apple.com` is not reachable from everywhere. Rather than let sign-in
++break with nothing to act on, the asset list can be supplied by hand:
++
++1. On a machine that *can* reach Apple, run `node tools/fetch-sap-assets.mjs`.
++2. Copy the resulting directory — the four binaries plus `sap-assets.json` — to
++   the deployment, and set `SAP_ASSETS_DIR` to where you put it.
++
++`sap-assets.json` describes what is expected there (name, path, size, SHA-256)
++and overrides the built-in list, which is also how you point the signer at a
++different build of those binaries. Every file is checked against its digest
++before being served; a file of the right length but wrong contents is reported
++as corrupt rather than handed to the emulator to fail on obscurely.
++
+ ## Security Recommendations
+ 
+ **DDoS Protection**
+diff --git a/backend/src/config.ts b/backend/src/config.ts
+index eddba52..47139b5 100644
+--- a/backend/src/config.ts
++++ b/backend/src/config.ts
+@@ -17,6 +17,10 @@ export const config = {
+   buildDate: process.env.BUILD_DATE || "unknown",
+   // Access password protection (empty = disabled)
+   accessPassword: process.env.ACCESS_PASSWORD || "",
++  // Where the SAP signer's Apple binaries live. Empty means DATA_DIR/sap,
++  // which is where the fetch endpoint puts them. Set it when the deployment
++  // cannot reach swcdn.apple.com and the files have to be supplied by hand.
++  sapAssetsDir: process.env.SAP_ASSETS_DIR || "",
+ };
+ 
+ export const accessPasswordHash = config.accessPassword
+diff --git a/backend/src/routes/sap.ts b/backend/src/routes/sap.ts
+index 53eaf8e..efc0f43 100644
+--- a/backend/src/routes/sap.ts
++++ b/backend/src/routes/sap.ts
+@@ -2,9 +2,9 @@ import express, { Router, Request, Response } from "express";
+ import { createReadStream } from "fs";
+ import path from "path";
+ import {
+-  REQUIRED_ASSETS,
+   assetDirectory,
+   fetchAssets,
++  requiredAssets,
+   verifyAsset,
+   verifyAssets,
+   type FetchProgress,
+@@ -80,7 +80,7 @@ router.get("/sap/assets/:name", async (req: Request, res: Response) => {
+   // Express 5 types a route parameter as string | string[]; the lookup below
+   // is what makes it safe either way.
+   const name = String(req.params.name ?? "");
+-  const spec = REQUIRED_ASSETS.find((asset) => asset.name === name);
++  const spec = (await requiredAssets()).find((asset) => asset.name === name);
+ 
+   // Only the four known names, so the parameter can never walk the filesystem.
+   if (!spec) {
+diff --git a/backend/src/services/sapAssets.ts b/backend/src/services/sapAssets.ts
+index 1a337f6..de23419 100644
+--- a/backend/src/services/sapAssets.ts
++++ b/backend/src/services/sapAssets.ts
+@@ -64,8 +64,100 @@ export const REQUIRED_ASSETS: AssetSpec[] = [
+   },
+ ];
+ 
++/**
++ * Where the four Apple binaries are read from.
++ *
++ * `SAP_ASSETS_DIR` overrides it for deployments that cannot reach
++ * swcdn.apple.com — a Space behind an egress filter, a host in a region where
++ * Apple's CDN is unreliable — where the files have to be copied in by hand
++ * instead of downloaded. Point it at a persistent volume, or the files are
++ * gone on every restart and sign-in breaks again.
++ */
+ export function assetDirectory(): string {
+-  return path.join(config.dataDir, "sap");
++  return config.sapAssetsDir || path.join(config.dataDir, "sap");
++}
++
++const MANIFEST_NAME = "sap-assets.json";
++
++// Reading and parsing the manifest on every poll of the status endpoint would
++// be waste, so the result is kept until the file changes.
++let manifestCache: { dir: string; mtimeMs: number; assets: AssetSpec[] } | null =
++  null;
++
++/**
++ * The assets the signer needs.
++ *
++ * `sap-assets.json` alongside the binaries overrides the built-in list. That
++ * is how a deployment supplies a different build — a newer OS X update, a
++ * mirror repacked elsewhere — without a code change, and it is what lets the
++ * verification below be exercised without 38 MB of Apple's binaries.
++ */
++export async function requiredAssets(): Promise<AssetSpec[]> {
++  const dir = assetDirectory();
++  const file = path.join(dir, MANIFEST_NAME);
++
++  let info: Awaited<ReturnType<typeof stat>>;
++  try {
++    info = await stat(file);
++  } catch {
++    manifestCache = null;
++    return REQUIRED_ASSETS;
++  }
++
++  if (
++    manifestCache &&
++    manifestCache.dir === dir &&
++    manifestCache.mtimeMs === info.mtimeMs
++  ) {
++    return manifestCache.assets;
++  }
++
++  let parsed: unknown;
++  try {
++    parsed = JSON.parse(await readFile(file, "utf8"));
++  } catch (error) {
++    throw new Error(
++      `${file} is not valid JSON: ${error instanceof Error ? error.message : error}`,
++    );
++  }
++
++  if (!Array.isArray(parsed) || parsed.length === 0) {
++    throw new Error(`${file} must be a non-empty array of asset descriptors`);
++  }
++
++  const assets = parsed.map((entry, index) => {
++    const item = entry as Partial<AssetSpec>;
++    if (!item.name || !item.path || !item.sha256) {
++      throw new Error(`${file} entry ${index} needs name, path and sha256`);
++    }
++    return {
++      name: item.name,
++      path: item.path,
++      size: Number(item.size ?? 0),
++      sha256: item.sha256,
++    };
++  });
++
++  manifestCache = { dir, mtimeMs: info.mtimeMs, assets };
++  return assets;
++}
++
++/**
++ * What to do when the assets are not there and cannot be fetched. Names every
++ * file with its exact size and digest, so whoever is copying them in by hand
++ * can tell a short or corrupted copy from a wrong one.
++ */
++export async function manualInstallHint(missing: string[]): Promise<string> {
++  const wanted = (await requiredAssets()).filter((asset) =>
++    missing.includes(asset.name),
++  );
++  const listing = wanted
++    .map((asset) => `  ${asset.name}  ${asset.size} bytes  sha256:${asset.sha256}`)
++    .join("\n");
++  return (
++    `Place these files in ${assetDirectory()} (or run tools/fetch-sap-assets.mjs ` +
++    `somewhere that can reach swcdn.apple.com and copy them over):\n${listing}`
++  );
+ }
+ 
+ export type AssetState = "ok" | "missing" | "corrupt";
+@@ -124,7 +216,7 @@ export async function verifyAssets(): Promise<{
+   const missing: string[] = [];
+   const corrupt: string[] = [];
+ 
+-  for (const spec of REQUIRED_ASSETS) {
++  for (const spec of await requiredAssets()) {
+     const state = await verifyAsset(spec);
+     if (state === "ok") ok.push(spec.name);
+     else if (state === "missing") missing.push(spec.name);
+@@ -135,9 +227,25 @@ export async function verifyAssets(): Promise<{
+ }
+ 
+ async function range(start: number, end?: number): Promise<Response> {
+-  const response = await fetch(UPDATE_URL, {
+-    headers: { Range: `bytes=${start}-${end ?? ""}` },
+-  });
++  let response: Response;
++  try {
++    response = await fetch(UPDATE_URL, {
++      headers: { Range: `bytes=${start}-${end ?? ""}` },
++    });
++  } catch (error) {
++    // Node reports a failed fetch as a bare "fetch failed" and keeps the
++    // reason — DNS, refused, TLS — on .cause. Without unwrapping it, an
++    // operator whose host cannot reach Apple's CDN gets two useless words and
++    // no idea there is another way to get the files in.
++    const cause = error instanceof Error ? error.cause : undefined;
++    throw new Error(
++      `cannot reach swcdn.apple.com to download the SAP assets` +
++        (cause ? `: ${cause instanceof Error ? cause.message : String(cause)}` : "") +
++        `.\nIf this host's egress is restricted, run tools/fetch-sap-assets.mjs ` +
++        `somewhere that can reach Apple, copy the directory over, and set ` +
++        `SAP_ASSETS_DIR to where you put it.`,
++    );
++  }
+ 
+   if (response.status !== 206 && response.status !== 200) {
+     throw new Error(`Apple returned ${response.status} for the update package`);
+@@ -238,6 +346,7 @@ export interface FetchProgress {
+ export async function fetchAssets(
+   onProgress?: (progress: FetchProgress) => void,
+ ): Promise<string[]> {
++  const required = await requiredAssets();
+   const target = assetDirectory();
+   await mkdir(target, { recursive: true });
+ 
+@@ -245,11 +354,22 @@ export async function fetchAssets(
+   // replaced rather than skipped, which is the whole point of checking the
+   // digest rather than the size.
+   const existing = await verifyAssets();
+-  if (existing.ok.length === REQUIRED_ASSETS.length) {
++  if (existing.ok.length === required.length) {
+     onProgress?.({ stage: "done", found: existing.ok });
+     return existing.ok;
+   }
+ 
++  // With SAP_ASSETS_DIR set the operator has said the files come from
++  // somewhere else. Downloading anyway would either fail on a host they
++  // cannot reach or quietly write over a directory they manage by hand.
++  if (config.sapAssetsDir) {
++    throw new Error(
++      `SAP_ASSETS_DIR is set to ${config.sapAssetsDir}, so the assets are ` +
++        `expected to be supplied rather than downloaded.\n` +
++        await manualInstallHint([...existing.missing, ...existing.corrupt]),
++    );
++  }
++
+   if (existing.corrupt.length) {
+     console.warn(`SAP assets: replacing corrupt ${existing.corrupt.join(", ")}`);
+   }
+@@ -274,7 +394,7 @@ export async function fetchAssets(
+     })(),
+   );
+ 
+-  const wanted = new Map(REQUIRED_ASSETS.map((asset) => [asset.path, asset]));
++  const wanted = new Map(required.map((asset) => [asset.path, asset]));
+   const found: string[] = [];
+   const pending = new Map<string, Buffer>();
+ 
+@@ -313,7 +433,7 @@ export async function fetchAssets(
+   onProgress?.({ stage: "verifying", found: [...found] });
+ 
+   const written: string[] = [];
+-  for (const asset of REQUIRED_ASSETS) {
++  for (const asset of required) {
+     const body = pending.get(asset.name);
+     if (!body) continue;
+ 
+@@ -336,8 +456,8 @@ export async function fetchAssets(
+     written.push(asset.name);
+   }
+ 
+-  if (written.length !== REQUIRED_ASSETS.length) {
+-    const missing = REQUIRED_ASSETS.filter(
++  if (written.length !== required.length) {
++    const missing = required.filter(
+       (asset) => !written.includes(asset.name),
+     ).map((asset) => asset.name);
+     throw new Error(`Apple payload did not contain ${missing.join(", ")}`);
+diff --git a/backend/tests/sapRoute.test.ts b/backend/tests/sapRoute.test.ts
+new file mode 100644
+index 0000000..622c3ea
+--- /dev/null
++++ b/backend/tests/sapRoute.test.ts
+@@ -0,0 +1,308 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import express from "express";
++import request from "supertest";
++import { createHash } from "crypto";
++import { mkdtemp, writeFile, rm, utimes } from "fs/promises";
++import { tmpdir } from "os";
++import path from "path";
++
++// The four real binaries are 38 MB and come from Apple's CDN, which is not
++// reachable from every build machine. What is under test here is the
++// bookkeeping around them — size and digest checks, what the endpoints answer
++// when a file is absent or wrong — and none of that cares what the bytes are.
++// A sap-assets.json manifest describes small stand-ins instead, which is the
++// same mechanism an operator uses to supply a different build.
++const STAND_INS = [
++  { name: "CommerceKit", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/CommerceKit", body: "commerce-kit" },
++  { name: "CommerceCore", path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Frameworks/CommerceCore.framework/Versions/A/CommerceCore", body: "commerce-core" },
++  { name: "CoreFP", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP", body: "core-fp" },
++  { name: "CoreFP.icxs", path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP.icxs", body: "core-fp-icxs" },
++];
++
++const SPECS = STAND_INS.map((asset) => ({
++  name: asset.name,
++  path: asset.path,
++  size: Buffer.byteLength(asset.body),
++  sha256: createHash("sha256").update(asset.body).digest("hex"),
++}));
++
++const bodies = Object.fromEntries(STAND_INS.map((a) => [a.name, a.body]));
++const specOf = (name: string) => SPECS.find((s) => s.name === name)!;
++
++let dir: string;
++
++async function loadModules(manifest: unknown = SPECS, raw?: string) {
++  if (raw !== undefined) {
++    await writeFile(path.join(dir, "sap-assets.json"), raw);
++  } else if (manifest !== null) {
++    await writeFile(path.join(dir, "sap-assets.json"), JSON.stringify(manifest));
++  }
++  vi.resetModules();
++  const routes = (await import("../src/routes/sap.js")).default;
++  const service = await import("../src/services/sapAssets.js");
++  const app = express();
++  app.use("/api", routes);
++  return { app, service };
++}
++
++const writeAsset = (name: string, body: string) =>
++  writeFile(path.join(dir, name), body);
++
++describe("SAP asset verification", () => {
++  beforeEach(async () => {
++    dir = await mkdtemp(path.join(tmpdir(), "asspp-sap-"));
++    process.env.SAP_ASSETS_DIR = dir;
++  });
++
++  afterEach(async () => {
++    delete process.env.SAP_ASSETS_DIR;
++    vi.resetModules();
++    await rm(dir, { recursive: true, force: true });
++  });
++
++  it("reads from SAP_ASSETS_DIR rather than DATA_DIR/sap", async () => {
++    const { service } = await loadModules();
++    expect(service.assetDirectory()).toBe(dir);
++  });
++
++  it("prefers the manifest next to the binaries over the built-in list", async () => {
++    const { service } = await loadModules();
++    const assets = await service.requiredAssets();
++
++    expect(assets).toEqual(SPECS);
++    expect(service.REQUIRED_ASSETS).not.toEqual(SPECS);
++  });
++
++  it("falls back to the built-in list when there is no manifest", async () => {
++    const { service } = await loadModules(null);
++    expect(await service.requiredAssets()).toEqual(service.REQUIRED_ASSETS);
++    expect(service.REQUIRED_ASSETS).toHaveLength(4);
++  });
++
++  it("rejects a manifest that is not usable, naming the file", async () => {
++    // Each case needs a fresh module: the parsed manifest is cached until the
++    // file changes, which is what keeps the status endpoint cheap to poll.
++    // Written raw, not through JSON.stringify: a stringified string is valid
++    // JSON, and would test the array check rather than the parse.
++    let { service } = await loadModules(null, "{ not json");
++    await expect(service.requiredAssets()).rejects.toThrow(
++      /sap-assets\.json is not valid JSON/,
++    );
++
++    vi.resetModules();
++    ({ service } = await loadModules([]));
++    await expect(service.requiredAssets()).rejects.toThrow(/non-empty array/);
++
++    vi.resetModules();
++    ({ service } = await loadModules([{ name: "x" }]));
++    await expect(service.requiredAssets()).rejects.toThrow(
++      /entry 0 needs name, path and sha256/,
++    );
++  });
++
++  it("reports every asset missing before anything is installed", async () => {
++    const { service } = await loadModules();
++    const result = await service.verifyAssets();
++
++    expect(result.ok).toEqual([]);
++    expect(result.missing.sort()).toEqual(SPECS.map((a) => a.name).sort());
++    expect(result.corrupt).toEqual([]);
++  });
++
++  it("accepts a file whose size and digest both match", async () => {
++    await writeAsset("CommerceKit", bodies.CommerceKit);
++
++    const { service } = await loadModules();
++    const result = await service.verifyAssets();
++
++    expect(result.ok).toEqual(["CommerceKit"]);
++    expect(result.missing).toHaveLength(SPECS.length - 1);
++  });
++
++  it("rejects a file of the right length but wrong contents", async () => {
++    // Same byte count, different bytes: the case a size-only check would wave
++    // through and the emulator would then fail on with nothing pointing here.
++    const impostor = "x".repeat(specOf("CommerceKit").size);
++    expect(Buffer.byteLength(impostor)).toBe(specOf("CommerceKit").size);
++    await writeAsset("CommerceKit", impostor);
++
++    const { service } = await loadModules();
++    const result = await service.verifyAssets();
++
++    expect(result.ok).toEqual([]);
++    expect(result.corrupt).toEqual(["CommerceKit"]);
++  });
++
++  it("reports a short file as corrupt rather than missing", async () => {
++    await writeAsset("CoreFP", "trunc");
++
++    const { service } = await loadModules();
++    const result = await service.verifyAssets();
++
++    expect(result.missing).not.toContain("CoreFP");
++    expect(result.corrupt).toContain("CoreFP");
++  });
++
++  it("re-checks a file once it is replaced", async () => {
++    const { service } = await loadModules();
++    expect((await service.verifyAssets()).corrupt).toEqual([]);
++
++    await writeAsset("CommerceCore", "wrong bytes but different length");
++    expect((await service.verifyAssets()).corrupt).toContain("CommerceCore");
++
++    await writeAsset("CommerceCore", bodies.CommerceCore);
++    const after = await service.verifyAssets();
++    expect(after.corrupt).toEqual([]);
++    expect(after.ok).toContain("CommerceCore");
++  });
++
++  it("notices a manifest edited in place", async () => {
++    const { service } = await loadModules();
++    expect(await service.requiredAssets()).toEqual(SPECS);
++
++    const edited = SPECS.slice(0, 1);
++    await writeFile(path.join(dir, "sap-assets.json"), JSON.stringify(edited));
++    // Same size, so mtime is what has to catch this.
++    const future = new Date(Date.now() + 5000);
++    await utimes(path.join(dir, "sap-assets.json"), future, future);
++
++    expect(await service.requiredAssets()).toEqual(edited);
++  });
++
++  it("refuses to download over a directory the operator supplies", async () => {
++    const { service } = await loadModules();
++
++    await expect(service.fetchAssets()).rejects.toThrow(
++      /SAP_ASSETS_DIR is set/,
++    );
++  });
++
++  it("names the missing files with their sizes and digests", async () => {
++    const { service } = await loadModules();
++    const hint = await service.manualInstallHint(["CoreFP", "CommerceKit"]);
++
++    expect(hint).toContain(dir);
++    expect(hint).toContain(`CoreFP  ${specOf("CoreFP").size} bytes`);
++    expect(hint).toContain(`sha256:${specOf("CoreFP").sha256}`);
++    expect(hint).toContain("CommerceKit");
++    expect(hint).not.toContain("CoreFP.icxs");
++  });
++});
++
++describe("SAP asset endpoints", () => {
++  beforeEach(async () => {
++    dir = await mkdtemp(path.join(tmpdir(), "asspp-sap-"));
++    process.env.SAP_ASSETS_DIR = dir;
++  });
++
++  afterEach(async () => {
++    delete process.env.SAP_ASSETS_DIR;
++    vi.resetModules();
++    await rm(dir, { recursive: true, force: true });
++  });
++
++  it("is not ready while assets are missing, and says which", async () => {
++    const { app } = await loadModules();
++    const res = await request(app).get("/api/sap/assets");
++
++    expect(res.status).toBe(200);
++    expect(res.body.ready).toBe(false);
++    expect(res.body.available).toEqual([]);
++    expect(res.body.missing).toHaveLength(SPECS.length);
++    expect(res.body.fetching).toBe(false);
++  });
++
++  it("becomes ready once every asset verifies", async () => {
++    for (const asset of STAND_INS) await writeAsset(asset.name, asset.body);
++
++    const { app } = await loadModules();
++    const res = await request(app).get("/api/sap/assets");
++
++    expect(res.body.ready).toBe(true);
++    expect(res.body.missing).toEqual([]);
++    expect(res.body.available.sort()).toEqual(SPECS.map((a) => a.name).sort());
++  });
++
++  it("answers 503 with a hint for an asset that is not installed", async () => {
++    const { app } = await loadModules();
++    const res = await request(app).get("/api/sap/assets/CoreFP");
++
++    expect(res.status).toBe(503);
++    expect(res.body.error).toContain("not installed");
++    expect(res.body.hint).toContain("/api/sap/assets/fetch");
++  });
++
++  it("answers 500 for an asset that fails its digest", async () => {
++    await writeAsset("CoreFP", "x".repeat(specOf("CoreFP").size));
++
++    const { app } = await loadModules();
++    const res = await request(app).get("/api/sap/assets/CoreFP");
++
++    expect(res.status).toBe(500);
++    expect(res.body.error).toContain("does not match its digest");
++  });
++
++  it("serves a verified asset with its exact bytes and an immutable cache header", async () => {
++    await writeAsset("CommerceCore", bodies.CommerceCore);
++
++    const { app } = await loadModules();
++    // The route serves application/octet-stream, which superagent leaves
++    // alone unless told to buffer it.
++    const res = await request(app)
++      .get("/api/sap/assets/CommerceCore")
++      .buffer(true)
++      .parse((response, callback) => {
++        const chunks: Buffer[] = [];
++        response.on("data", (chunk: Buffer) => chunks.push(chunk));
++        response.on("end", () => callback(null, Buffer.concat(chunks)));
++      });
++
++    expect(res.status).toBe(200);
++    expect((res.body as Buffer).toString("utf8")).toBe(bodies.CommerceCore);
++    expect(res.headers["content-length"]).toBe(String(specOf("CommerceCore").size));
++    expect(res.headers["cache-control"]).toContain("immutable");
++  });
++
++  it("refuses a name that is not in the manifest", async () => {
++    const { app } = await loadModules();
++    const res = await request(app).get("/api/sap/assets/not-an-asset");
++
++    expect(res.status).toBe(404);
++    expect(res.body.error).toBe("Unknown SAP asset");
++  });
++});
++
++describe("SAP asset download failure", () => {
++  beforeEach(async () => {
++    dir = await mkdtemp(path.join(tmpdir(), "asspp-sap-"));
++    process.env.DATA_DIR = dir;
++    delete process.env.SAP_ASSETS_DIR;
++  });
++
++  afterEach(async () => {
++    delete process.env.DATA_DIR;
++    vi.resetModules();
++    vi.unstubAllGlobals();
++    await rm(dir, { recursive: true, force: true });
++  });
++
++  it("says why the CDN was unreachable and what to do instead", async () => {
++    // Node collapses every fetch failure into "fetch failed" and puts the
++    // actual reason on .cause. An operator on a restricted host needs both.
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(async () => {
++        throw Object.assign(new Error("fetch failed"), {
++          cause: new Error("getaddrinfo ENOTFOUND swcdn.apple.com"),
++        });
++      }),
++    );
++
++    vi.resetModules();
++    const { fetchAssets } = await import("../src/services/sapAssets.js");
++
++    await expect(fetchAssets()).rejects.toThrow(
++      /cannot reach swcdn\.apple\.com[\s\S]*ENOTFOUND[\s\S]*SAP_ASSETS_DIR/,
++    );
++  });
++});
+diff --git a/frontend/src/components/Search/ProductDetail.tsx b/frontend/src/components/Search/ProductDetail.tsx
+index 235b25c..de8f43b 100644
+--- a/frontend/src/components/Search/ProductDetail.tsx
++++ b/frontend/src/components/Search/ProductDetail.tsx
+@@ -245,9 +245,7 @@ export default function ProductDetail() {
+               >
+                 {t("search.product.versionHistory")}
+               </Link>
+-              <div className="flex items-center">
+-                <SapStatus />
+-              </div>
++              <SapStatus />
+             </div>
+           </section>
+         )}
+diff --git a/frontend/src/components/common/SapStatus.tsx b/frontend/src/components/common/SapStatus.tsx
+index cd0bad6..f4b6452 100644
+--- a/frontend/src/components/common/SapStatus.tsx
++++ b/frontend/src/components/common/SapStatus.tsx
+@@ -8,6 +8,11 @@ import { useSapStore } from "../../store/sap";
+  *
+  * The signer starts preparing in the background on load, so this is usually
+  * showing progress already under way rather than something a press started.
++ *
++ * `col-span-full` keeps it from eating a track of its own when the parent is a
++ * grid — ProductDetail lays its actions out with `grid-flow-col auto-cols-fr`,
++ * where an always-present wrapper would squeeze the buttons even while this
++ * renders nothing. The class is inert in the flex parents it is also used in.
+  */
+ export default function SapStatus() {
+   const { t } = useTranslation();
+@@ -19,14 +24,14 @@ export default function SapStatus() {
+ 
+   if (stage === "error") {
+     return (
+-      <span className="text-sm text-red-600 dark:text-red-400">
++      <span className="col-span-full flex items-center text-sm text-red-600 dark:text-red-400">
+         {t("accounts.addForm.signerFailed", { error: error ?? "" })}
+       </span>
+     );
+   }
+ 
+   return (
+-    <span className="text-sm text-gray-600 dark:text-gray-400">
++    <span className="col-span-full flex items-center text-sm text-gray-600 dark:text-gray-400">
+       {stage === "assets"
+         ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
+         : t("accounts.addForm.preparingSigner")}
+diff --git a/frontend/tests/apple/authenticate.test.ts b/frontend/tests/apple/authenticate.test.ts
+index 1b94ea6..804fb25 100644
+--- a/frontend/tests/apple/authenticate.test.ts
++++ b/frontend/tests/apple/authenticate.test.ts
+@@ -3,6 +3,7 @@ import { buildPlist } from "../../src/apple/plist";
+ import { authenticate } from "../../src/apple/authenticate";
+ import { appleRequest } from "../../src/apple/request";
+ import { fetchBag } from "../../src/apple/bag";
++import { prepareSigner, signAction } from "../../src/apple/sap/client";
+ 
+ vi.mock("../../src/apple/request", () => ({
+   appleRequest: vi.fn(),
+@@ -14,9 +15,39 @@ vi.mock("../../src/apple/bag", () => ({
+     "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
+ }));
+ 
++// The real client spins up a Web Worker that emulates Apple's signing code.
++// jsdom has no Worker, and none of that is what these tests are about.
++vi.mock("../../src/apple/sap/client", () => ({
++  prepareSigner: vi.fn().mockResolvedValue(undefined),
++  signAction: vi.fn(),
++}));
++
++function mockSuccessfulAuth() {
++  vi.mocked(appleRequest).mockResolvedValue({
++    status: 200,
++    statusText: "OK",
++    headers: {},
++    rawHeaders: [],
++    body: buildPlist({
++      accountInfo: {
++        appleId: "test@example.com",
++        address: {
++          firstName: "Test",
++          lastName: "User",
++        },
++      },
++      passwordToken: "token",
++      dsPersonId: "123",
++    }),
++  });
++}
++
+ describe("apple/authenticate", () => {
+   beforeEach(() => {
+     vi.clearAllMocks();
++    vi.mocked(prepareSigner).mockResolvedValue(undefined);
++    vi.mocked(signAction).mockResolvedValue(new Uint8Array([0xde, 0xad]));
++    mockSuccessfulAuth();
+   });
+ 
+   it("sets guid query exactly once from bag endpoint", async () => {
+@@ -24,23 +55,6 @@ describe("apple/authenticate", () => {
+       authURL:
+         "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate?foo=1&guid=old-value",
+     });
+-    vi.mocked(appleRequest).mockResolvedValue({
+-      status: 200,
+-      statusText: "OK",
+-      headers: {},
+-      rawHeaders: [],
+-      body: buildPlist({
+-        accountInfo: {
+-          appleId: "test@example.com",
+-          address: {
+-            firstName: "Test",
+-            lastName: "User",
+-          },
+-        },
+-        passwordToken: "token",
+-        dsPersonId: "123",
+-      }),
+-    });
+ 
+     await authenticate(
+       "test@example.com",
+@@ -57,4 +71,75 @@ describe("apple/authenticate", () => {
+     expect(endpoint.searchParams.getAll("guid")).toHaveLength(1);
+     expect(endpoint.searchParams.get("foo")).toBe("1");
+   });
++
++  it("prepares a signer for the device before contacting Apple", async () => {
++    vi.mocked(fetchBag).mockResolvedValue({
++      authURL:
++        "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
++    });
++
++    await authenticate(
++      "test@example.com",
++      "password",
++      undefined,
++      undefined,
++      "aabbccddeeff",
++    );
++
++    expect(prepareSigner).toHaveBeenCalledWith("aabbccddeeff", undefined);
++    expect(vi.mocked(prepareSigner).mock.invocationCallOrder[0]).toBeLessThan(
++      vi.mocked(appleRequest).mock.invocationCallOrder[0],
++    );
++  });
++
++  it("sends the SAP signature base64-encoded in X-Apple-ActionSignature", async () => {
++    vi.mocked(fetchBag).mockResolvedValue({
++      authURL:
++        "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
++    });
++
++    await authenticate(
++      "test@example.com",
++      "password",
++      undefined,
++      undefined,
++      "aabbccddeeff",
++    );
++
++    // The signature covers the request body, so it has to be produced from
++    // exactly the bytes that go out.
++    const signed = vi.mocked(signAction).mock.calls[0][0];
++    expect(new TextDecoder().decode(signed)).toContain(
++      "<key>appleId</key><string>test@example.com</string>",
++    );
++
++    const headers = vi.mocked(appleRequest).mock.calls[0][0].headers;
++    expect(headers?.["X-Apple-ActionSignature"]).toBe(
++      btoa(String.fromCharCode(0xde, 0xad)),
++    );
++  });
++
++  it("propagates a signer failure instead of sending an unsigned request", async () => {
++    vi.mocked(fetchBag).mockResolvedValue({
++      authURL:
++        "https://buy.itunes.apple.com/WebObjects/MZFinance.woa/wa/authenticate",
++    });
++    vi.mocked(prepareSigner).mockRejectedValue(
++      new Error("timed out preparing the SAP signer"),
++    );
++
++    await expect(
++      authenticate(
++        "test@example.com",
++        "password",
++        undefined,
++        undefined,
++        "aabbccddeeff",
++      ),
++    ).rejects.toThrow("timed out preparing the SAP signer");
++
++    // An unsigned request is the one Apple answers with 403 and an empty
++    // body, so it must never go out.
++    expect(appleRequest).not.toHaveBeenCalled();
++  });
+ });
+-- 
+2.39.5
+
