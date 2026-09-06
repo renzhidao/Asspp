@@ -1,0 +1,179 @@
+From 9eaef9f2bcfe7a59e301584955e93d0d46ac0234 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 16:59:24 +0000
+Subject: [PATCH] Record version history, and say why it refused
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Loading version history failed with a toast and nothing else. The report had no
+trace of it, and the message itself — "License required", or Apple's own words
+verbatim — carried no failureType, which is the part that says which rule
+refused. Same shape as the download refusal, in a file nobody had looked at.
+
+The code goes in the message, and the attempt goes in the activity log with its
+outcome, duration and reason.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/versionFinder.ts           | 12 +++-
+ .../src/components/Search/VersionHistory.tsx  | 18 ++++++
+ frontend/src/store/activity.ts                |  2 +-
+ frontend/tests/apple/versionFinder.test.ts    | 58 +++++++++++++++++++
+ 4 files changed, 86 insertions(+), 4 deletions(-)
+ create mode 100644 frontend/tests/apple/versionFinder.test.ts
+
+diff --git a/frontend/src/apple/versionFinder.ts b/frontend/src/apple/versionFinder.ts
+index 470e228..393a44e 100644
+--- a/frontend/src/apple/versionFinder.ts
++++ b/frontend/src/apple/versionFinder.ts
+@@ -79,12 +79,18 @@ export async function listVersions(
+ 
+         switch (failureType) {
+           case "2034":
+-            throw new Error("Password token is expired");
++            throw new Error("Password token is expired (2034)");
+           case "9610":
+-            throw new Error("License required - purchase the app first");
++            throw new Error("License required - purchase the app first (9610)");
+           default: {
++            // The same dead end the download had: Apple's words alone, with the
++            // code that says which rule refused left behind in the response.
+             const msg = dict.customerMessage as string | undefined;
+-            throw new Error(msg ?? "No items in response");
++            throw new Error(
++              msg
++                ? `${msg} (${failureType})`
++                : `No items in response (${failureType})`,
++            );
+           }
+         }
+       }
+diff --git a/frontend/src/components/Search/VersionHistory.tsx b/frontend/src/components/Search/VersionHistory.tsx
+index 9acc503..f1a03c8 100644
+--- a/frontend/src/components/Search/VersionHistory.tsx
++++ b/frontend/src/components/Search/VersionHistory.tsx
+@@ -9,6 +9,7 @@ import { listVersions } from "../../apple/versionFinder";
+ import { storeIdToCountry } from "../../apple/config";
+ import { getVersionMetadata } from "../../apple/versionLookup";
+ import { getErrorMessage } from "../../utils/error";
++import { useActivityStore } from "../../store/activity";
+ import { useToastStore } from "../../store/toast";
+ import type { Software, VersionMetadata } from "../../types";
+ 
+@@ -18,6 +19,7 @@ export default function VersionHistory() {
+   const { accounts, updateAccount } = useAccounts();
+   const { t } = useTranslation();
+   const addToast = useToastStore((s) => s.addToast);
++  const recordActivity = useActivityStore((s) => s.record);
+   const { startDownload, toastDownloadError } = useDownloadAction();
+ 
+   const stateApp = (location.state as { app?: Software; country?: string })
+@@ -56,11 +58,27 @@ export default function VersionHistory() {
+   async function handleLoadVersions() {
+     if (!account || !app) return;
+     setLoading(true);
++    const beganAt = Date.now();
+     try {
+       const result = await listVersions(account, app);
+       setVersions(result.versions);
+       await updateAccount({ ...account, cookies: result.updatedCookies });
++      recordActivity({
++        kind: "versions",
++        target: app.name,
++        ok: true,
++        tookMs: Date.now() - beganAt,
++      });
+     } catch (e) {
++      // This failed silently as far as the report was concerned: the toast
++      // went by and nothing was written down.
++      recordActivity({
++        kind: "versions",
++        target: app.name,
++        ok: false,
++        detail: getErrorMessage(e, "unknown"),
++        tookMs: Date.now() - beganAt,
++      });
+       addToast(getErrorMessage(e, t("search.versions.loadFailed")), "error");
+     } finally {
+       setLoading(false);
+diff --git a/frontend/src/store/activity.ts b/frontend/src/store/activity.ts
+index 3b9ba1f..4e57dcc 100644
+--- a/frontend/src/store/activity.ts
++++ b/frontend/src/store/activity.ts
+@@ -10,7 +10,7 @@ import { create } from "zustand";
+  */
+ export interface ActivityEntry {
+   at: number;
+-  kind: "search" | "license" | "download" | "authenticate";
++  kind: "search" | "license" | "download" | "versions" | "authenticate";
+   /** What it was about, as the user would recognise it. Never a credential. */
+   target: string;
+   ok: boolean;
+diff --git a/frontend/tests/apple/versionFinder.test.ts b/frontend/tests/apple/versionFinder.test.ts
+new file mode 100644
+index 0000000..4787e2c
+--- /dev/null
++++ b/frontend/tests/apple/versionFinder.test.ts
+@@ -0,0 +1,58 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++// "Could not load version history" was the whole of what a user got. The
++// response had a failureType that said which rule refused, and it was dropped.
++
++const appleRequest = vi.hoisted(() => vi.fn());
++
++vi.mock("../../src/apple/request", () => ({ appleRequest }));
++
++const { listVersions } = await import("../../src/apple/versionFinder");
++
++const account = {
++  email: "a@example.com",
++  directoryServicesIdentifier: "d",
++  store: "143465",
++  cookies: [],
++  deviceIdentifier: "8a85f3e21c9d",
++} as never;
++
++const app = { id: "1468454200", name: "番茄小说" } as never;
++
++function respond(fields: Record<string, string>) {
++  const body = Object.entries(fields)
++    .map(([key, value]) => `    <key>${key}</key>\n    <string>${value}</string>`)
++    .join("\n");
++  appleRequest.mockResolvedValue({
++    status: 200,
++    body: `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n  <dict>\n${body}\n  </dict>\n</plist>`,
++    headers: {},
++    rawHeaders: [],
++  });
++}
++
++describe("version history refusals", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("says which rule refused", async () => {
++    respond({ failureType: "9008", customerMessage: "App Not Available" });
++
++    await expect(listVersions(account, app)).rejects.toThrow(
++      /App Not Available \(9008\)/,
++    );
++  });
++
++  it("names the missing licence instead of a generic nothing", async () => {
++    respond({ failureType: "9610" });
++
++    await expect(listVersions(account, app)).rejects.toThrow(/9610/);
++  });
++
++  it("still carries the code when Apple sends no words", async () => {
++    respond({ failureType: "9008" });
++
++    await expect(listVersions(account, app)).rejects.toThrow(
++      /No items in response \(9008\)/,
++    );
++  });
++});
+-- 
+2.39.5
+
