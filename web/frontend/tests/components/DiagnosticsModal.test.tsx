@@ -1,18 +1,36 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import DiagnosticsModal from "../../src/components/Settings/DiagnosticsModal";
+import SapStatus from "../../src/components/common/SapStatus";
 import { apiGet } from "../../src/api/client";
 import { useAccountsStore } from "../../src/store/accounts";
 import { useSapStore } from "../../src/store/sap";
 import type { Account } from "../../src/types";
 
 vi.mock("../../src/api/client", () => ({ apiGet: vi.fn() }));
-vi.mock("../../src/store/toast", () => ({
-  useToastStore: Object.assign(vi.fn(() => ({ addToast: vi.fn() })), {
-    // The component reads the store via a selector.
-    ...{},
+
+// The repo's usual mock is `t: (key) => key`, which drops interpolation
+// options. SapStatus passes the elapsed seconds as one, and a timer whose
+// number never reaches the screen is the exact thing being tested, so this
+// mock renders the options alongside the key and the assertions read them back.
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({
+    // DiagnosticsModal reads i18n.language for the report's [browser] section.
+    i18n: { language: "en-US" },
+    t: (key: string, options?: Record<string, unknown>) =>
+      options ? `${key} ${JSON.stringify(options)}` : key,
   }),
+}));
+// The component reads this store through a selector —
+// useToastStore((state) => state.addToast) — so the mock has to call the
+// selector with a state, not hand back the state itself. Returning the state
+// directly makes addToast a non-function, and the failure only surfaces in the
+// copy's catch branch, as an unhandled rejection that outlives the test.
+const addToast = vi.fn();
+vi.mock("../../src/store/toast", () => ({
+  useToastStore: (selector: (state: any) => any) =>
+    selector({ addToast: (...args: unknown[]) => addToast(...args) }),
 }));
 
 const SECRET = "password-that-must-not-appear";
@@ -106,6 +124,70 @@ describe("DiagnosticsModal", () => {
     const { container } = render(<SapStatus />);
 
     expect(container.textContent).toBe("accounts.addForm.installingAssets");
+    // No percentage is invented for a fetch whose size the browser never
+    // sees, and no seconds are counted for one the browser is not waiting on.
+    expect(container.textContent).not.toMatch(/\d/);
+    expect(container.textContent).not.toContain("setupElapsed");
+  });
+
+  it("counts up while the signer is being set up, so the wait is visibly alive", () => {
+    // The stage from a real field report: assets are in hand, and the worker is
+    // inside one long blocking call that cannot report from within. Nothing
+    // else on screen moves, so without a counter this is indistinguishable
+    // from a dead tab.
+    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
+
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<SapStatus />);
+      expect(container.textContent).toContain("accounts.addForm.preparingSigner");
+
+      // The seconds travel to t() as interpolation data, so read them back out
+      // of the component's own rendering rather than assuming a format.
+      const seconds = () =>
+        Number(/"seconds":(\d+)/.exec(container.textContent!)![1]);
+
+      expect(container.textContent).toContain("accounts.addForm.setupElapsed");
+      expect(seconds()).toBe(0);
+
+      act(() => {
+        vi.advanceTimersByTime(3000);
+      });
+      expect(seconds()).toBe(3);
+
+      act(() => {
+        vi.advanceTimersByTime(9000);
+      });
+      expect(seconds()).toBe(12);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops counting once the signer leaves the setup stage", () => {
+    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
+
+    vi.useFakeTimers();
+    try {
+      const { container } = render(<SapStatus />);
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(container.textContent).toContain('"seconds":5');
+
+      act(() => {
+        useSapStore.setState({ stage: "ready", percent: null } as any);
+      });
+      // Renders nothing once ready — and the interval must be gone with it.
+      expect(container.textContent).toBe("");
+
+      act(() => {
+        vi.advanceTimersByTime(5000);
+      });
+      expect(container.textContent).toBe("");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("copies the report to the clipboard on request", async () => {

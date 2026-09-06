@@ -9,9 +9,9 @@
 | 路径 | 内容 |
 | --- | --- |
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 6 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `Resources/Document/patches/` | 同样 7 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-六个 commit：
+七个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -20,6 +20,7 @@
 0004 Make SAP assets suppliable without Apple's CDN; test the SAP routes  ← 本次新增
 0005 Add a diagnostics report that needs no console            ← 本次新增
 0006 Report SAP asset progress honestly                        ← 本次新增
+0007 Show elapsed time while the signer is being set up        ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -179,6 +180,36 @@ note: contains no password, passwordToken, cookie or DSID by construction.
 被当成字节百分比读 —— 于是**一个字节都还没下载就显示 100%**。现在它有独立的
 `installing` 阶段，不给百分比，因为那时候没有诚实的百分比可给。
 
+## 卡住的其实是 `setup`，而那一段的屏幕原本是静止的
+
+第二份报告（`buildCommit: 6e5eb7a5`）显示 `stage: setup`、`percent: -`。
+这说明**资产阶段已经过去了** —— 38 MB 已下载并成功在浏览器里装载，现在卡在
+SAP 握手本身。界面上那句「正在初始化签名器，约需一分钟…」是整段等待里**唯一**
+的字，而且一动不动。
+
+这不是猜的，是读代码确认的：`worker.ts` 在 `Signer.create()` **之前**发出
+`{phase:"setup"}`，之后就是一整块同步调用
+（`Machine.open` → `initialize` → 两次 `exchange`），期间 worker 发不出任何消息。
+`client.ts` 侧的超时是 **15 分钟**（`SETUP_TIMEOUT_MS`），所以 15 分钟内它既不会报错也不会变字。
+
+上游 `frontend/src/apple/sap/README.md` 里自己的量测：
+
+| 环境 | setup | 每次签名 |
+|---|---|---|
+| WebKit（Playwright / iPhone 15 profile） | **35 s** | 3.5 s |
+| Node | 63 s | — |
+| Chrome（桌面） | **115 s** | 12 s |
+
+`initialize` 跑约 5.3M 条被仿真的指令，两次 `exchange` 再约 5M。
+
+**这三行里没有一个是真手机。** 那份报告来自 Android 10 上的 Chrome 142 —— 真实的
+ARM 设备跑 unicorn.js 的 WebAssembly，上面三个数字都不适用，而且很可能慢好几倍。
+所以「约需一分钟」对它来说是明显失真的。**这个环境下到底多久，我没有量测，不敢报数。**
+
+`0007` 不去编一个百分比（那时候没有诚实的百分比可给），改成**数秒**：
+屏幕上的数字每秒动一次，是「还在跑」唯一诚实的证据；文案也改成
+「首次约 1 分钟，手机上会明显更久」。离开 `setup` 阶段时计时器清掉。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -186,15 +217,17 @@ note: contains no password, passwordToken, cookie or DSID by construction.
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **121 passed / 15 files**（基线 96；新增 3 个签名测试、13 个诊断构建测试、4 个诊断弹窗渲染测试、5 个进度语义测试） |
+| 前端测试 | `frontend` `npm test` | **123 passed / 15 files**（基线 96；新增 3 个签名测试、13 个诊断构建测试、6 个诊断弹窗/SAP 状态渲染测试、5 个进度语义测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **六个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **七个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 计时器真抓得住「静止的屏幕」 | 把计时逻辑拆掉再跑测试 | 2 个失败：`to contain 'setupElapsed'`、`to contain '"seconds":5'` |
 | 进度修复真抓得住 bug | 把累加逻辑还原成旧写法再跑测试 | 3 个失败，其中 `expected 100 to be less than 50` —— 正是日志里那个 100% |
+| 既有缺陷 | `DiagnosticsModal` 的 toast mock | 原本每轮都留一个 `addToast is not a function` 未处理拒绝，已修 |
 | 诊断按钮真渲染 | 组件测试 + 打印真实输出 | 弹窗渲染、两个接口都被调用、剪贴板收到内容、且内容不含凭据 |
 
 新增测试覆盖的具体行为（都是断言真实代码路径，不是 stand-in）：

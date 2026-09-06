@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useSapStore } from "../../store/sap";
 
@@ -20,6 +21,28 @@ export default function SapStatus() {
   const percent = useSapStore((state) => state.percent);
   const error = useSapStore((state) => state.error);
 
+  // Setting a signer up is a long, single-threaded wait inside the worker, and
+  // the worker cannot report from inside it — so from outside it is
+  // indistinguishable from a dead tab. The download and install phases have
+  // real numbers to show; this one has none, so it counts up instead. A number
+  // that moves is the only honest "still working" available here, and the wait
+  // is long enough that a fixed estimate reads as a hang once it is passed.
+  const [elapsed, setElapsed] = useState(0);
+
+  useEffect(() => {
+    if (stage !== "setup") {
+      setElapsed(0);
+      return;
+    }
+
+    const startedAt = Date.now();
+    const timer = setInterval(
+      () => setElapsed(Math.round((Date.now() - startedAt) / 1000)),
+      1000,
+    );
+    return () => clearInterval(timer);
+  }, [stage]);
+
   if (stage === "idle" || stage === "ready") return null;
 
   if (stage === "error") {
@@ -36,7 +59,10 @@ export default function SapStatus() {
         ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
         : stage === "installing"
           ? t("accounts.addForm.installingAssets")
-          : t("accounts.addForm.preparingSigner")}
+          : `${t("accounts.addForm.preparingSigner")} ${t(
+              "accounts.addForm.setupElapsed",
+              { seconds: elapsed },
+            )}`}
     </span>
   );
 }
