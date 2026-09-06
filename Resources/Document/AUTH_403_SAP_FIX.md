@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十四个 commit：
+十六个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -438,6 +438,27 @@ SAP guest call exceeded 180s (elapsed 180.0s, 1003147 blocks,
 `0014` 让 `begin()` 从空时间线开始，同时把失败原因存进 `lastError` 跨次保留：
 此前重试会把 `error` 清掉，也就是**用「再试一次」这个动作擦掉了上一次的唯一证据**，
 于是「状态栏自己消失了」之后什么都留不下。报告新增 `previousAttemptFailed` 一行。
+
+## 桌面能登录了，但每个按钮都要重跑一次 setup
+
+`useDownloadAction.ts` 的 `acquireLicense()` 每次都先重新登录：
+
+```ts
+const renewed = await authenticate(
+  account.email, account.password, undefined,
+  account.cookies, account.deviceIdentifier,
+);
+```
+
+而 `authenticate()` 的第一步就是 `prepareSigner()`。签名器活在 worker 内存里，
+刷新页面就没了，于是「获取许可证」这一下要重跑整个 setup。
+
+`useSapWarmup` 就是为这件事写的 —— 有账号时在后台自动重建签名器。
+**但没有任何地方 import 它**，`grep -rn useSapWarmup src/` 只命中它自己的定义。
+`0016` 把它挂到 `App` 上，一行。
+
+签名器**无法**跨刷新保存：它是 unicorn.js 里一台跑着的仿真机，状态就是那块仿真内存。
+能做的是让它自动重建，而不是等需要它的那次点击。
 
 ## 我验证到了什么（全部本次实跑）
 

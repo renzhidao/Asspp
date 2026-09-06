@@ -8,6 +8,7 @@ import GlobalDownloadNotifier from './components/common/GlobalDownloadNotifier';
 import ToastContainer from './components/common/ToastContainer';
 import PasswordGate from './components/Auth/PasswordGate';
 import { useSettingsStore } from './store/settings';
+import { useSapWarmup } from './hooks/useSapWarmup';
 
 const HomePage = lazy(() => import('./components/Welcome/HomePage'));
 const AccountList = lazy(() => import('./components/Account/AccountList'));
@@ -44,6 +45,13 @@ function Loading() {
 
 export default function App() {
   const theme = useSettingsStore((s) => s.theme);
+
+  // The signer lives in worker memory, so a reload drops it. Without this the
+  // next action that signs — acquiring a licence re-authenticates, which signs
+  // — sits and waits for the whole setup again. Starting it here means it is
+  // rebuilding in the background from the moment there is an account to bind
+  // it to, instead of on the click that needs it.
+  useSapWarmup();
 
   useEffect(() => {
     const root = window.document.documentElement;
