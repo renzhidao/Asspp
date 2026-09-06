@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十个 commit：
+二十一个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -544,6 +544,16 @@ exchange.2         +130.5s  took  4.4s
 
 响应里有 `failureType`，但 `purchase.ts` 在有 `customerMessage` 时只抛那句话，
 把数字码丢了 —— 而那句话说明不了是哪条规则拒绝的。`0020` 让两处都把数字码带上。
+
+`0020` 部署之后（`b773b6e`）重试，**错误里仍然没有数字码**。所以那句话根本不是
+`purchase.ts` 抛的，也不是 `noItems` 抛的。
+
+真正抛它的是 `download.ts` 的 default 分支：volumeStore 端点自己回了
+`failureType` + `customerMessage="App Not Available"`，default 分支在有
+`customerMessage` 时只抛那句话，**并且在 `songList` 检查之前就 return 了** ——
+`0018`/`0020` 加证据的那个分支根本走不到。
+
+`0021` 把数字码加在真正抛错的那一行。
 
 **具体是哪条规则，仍然未知**，要等带数字码的那一次。
 

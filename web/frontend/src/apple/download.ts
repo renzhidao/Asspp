@@ -111,10 +111,21 @@ export async function getDownloadInfo(
               failureType,
             );
           }
-          // If apple provides a specific string, we fall back to it, otherwise we use the localized default.
-          throw new DownloadError(
-            customerMessage ??
+          // If apple provides a specific string, we fall back to it, otherwise
+          // we use the localized default.
+          if (!customerMessage) {
+            throw new DownloadError(
               i18n.t("errors.download.downloadFailed", { failureType }),
+              failureType,
+            );
+          }
+          // Apple's words go out, and so does its code. "App Not Available" is
+          // what the volumeStore endpoint answers for apps that are live and
+          // free in the account's storefront, so on its own it identifies
+          // nothing — and this branch throws before the empty-songList check
+          // below ever runs, which is where the code used to be attached.
+          throw new DownloadError(
+            `${customerMessage} (${failureType})`,
             failureType,
           );
         }
