@@ -9,9 +9,9 @@
 | 路径 | 内容 |
 | --- | --- |
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 11 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `Resources/Document/patches/` | 同样 12 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十一个 commit：
+十二个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -25,6 +25,7 @@
 0009 Report which setup step is running, and on what hardware  ← 本次新增
 0010 Record one setup step per line                            ← 本次新增
 0011 Bound the unassisted guest run so it fails, not hangs     ← 本次新增
+0012 Give one guest call a wall-clock deadline and report it   ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -364,6 +365,34 @@ if (!block) {
 但也没有任何损失。`unassistedAllowance` 的算术有 4 个单元测试；
 `run()` 驱动真实仿真器的那一段**没有**测试，此环境没有 38 MB 真实二进制。
 
+## `0011` 的判断被否掉了
+
+同一台设备部署 `cb9c1745`（带上界）后：`exchange.1` 跑了 **332 秒**，
+上界**没有触发**。
+
+这台设备的实测吞吐是 `machine.initialize` 的 530 万条 / 72.4 秒 ≈ **7.3 万条/秒**，
+200 万条只需约 **27 秒**。332 秒 ≫ 27 秒而错误未出现，说明**无辅助指令跑了不到
+200 万条** —— 时间花在别处。**「解码器认不出的指令块」这个判断是错的。**
+
+排除了这一条之后，剩下的可能是每块开销（每轮 `measure()` 要读
+`32 × 15 = 480` 字节再解码）或仿真本身，**但这两者从外部无法区分** ——
+仿真器是同步的，运行期间发不出任何消息。
+
+`0012` 不再猜：给**单次 guest 调用**加 180 秒墙上时钟上限，超了就抛出带统计的错误：
+
+```
+SAP guest call exceeded 180s (elapsed 181.4s, 4200000 blocks,
+3 undecodable, 60000 unassisted instructions, budget left 99940000)
+```
+
+这四个数能分开两种失败模式：
+- **blocks 极多而 budget 几乎没动** → guest 在打转，或每块开销占主导，不是指令数不够
+- **undecodable 很多** → 回到解码器覆盖不足（但那已被 332 秒的观测排除）
+- **unassisted 接近 200 万** → `0011` 的上界正在生效，只是还没到
+
+180 秒的依据：桌面整个 setup 115 秒，单次调用远低于此；这台设备是 1.2 倍。
+单次调用超过三分钟不是设备慢，是 guest 没有推进。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -371,14 +400,14 @@ if (!block) {
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **143 passed / 21 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、4 个 guest 预算测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
+| 前端测试 | `frontend` `npm test` | **147 passed / 22 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、4 个 guest 预算测试、4 个 guest 时限测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **十一个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **十二个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
 | 单行记录真抓得住错 | 把时间线改回逐条打印 | 1 个失败：`expected [ …(7) ] to have a length of 4 but got 7` |
 | store 折叠真抓得住错 | 把 `recordEvent` 改回无条件追加 | 3 个失败，其中 `expected [ …(3) ] to have a length of 2 but got 3` |
 | 时间线真抓得住错 | 把配对逻辑写成「找另一条同名结束条目」 | 2 个失败：`machine.open` 明明结束了却报 `STILL RUNNING` |

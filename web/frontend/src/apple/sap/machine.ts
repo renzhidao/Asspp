@@ -66,6 +66,53 @@ const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
  * tested here, while the arithmetic that decides whether a guest is allowed to
  * continue can be.
  */
+// How long one guest call may take before it is called a failure.
+//
+// A desktop finishes the entire setup in 115 seconds, so one call there is
+// well under two minutes. The phone in the field reports runs at 1.2x that.
+// Anything past three minutes for a single call is not a slow device, it is a
+// guest that is not making progress — and the caller's own 15 minute timeout
+// is far too blunt to say anything about why.
+const GUEST_CALL_DEADLINE_MS = 180_000;
+
+export interface GuestRunStats {
+  /** Wall-clock milliseconds since the call began. */
+  elapsedMs: number;
+  /** Turns of the run loop, one per basic block considered. */
+  steps: number;
+  /** Blocks the decoder could not read. */
+  measureFailures: number;
+  /** Instructions handed to the emulator without splitting help. */
+  unassisted: number;
+  /** Remaining instruction budget. */
+  budget: number;
+}
+
+/**
+ * Whether a guest call has run past its deadline.
+ *
+ * Split out from run() for the same reason as unassistedAllowance: run() drives
+ * the emulator and cannot be unit tested here, while the decision can be.
+ */
+export function deadlineExceeded(
+  startedAt: number,
+  now: number,
+  limitMs: number = GUEST_CALL_DEADLINE_MS,
+): boolean {
+  return now - startedAt > limitMs;
+}
+
+/** The stats as one line, for an error message. */
+export function describeGuestRun(stats: GuestRunStats): string {
+  return (
+    `elapsed ${(stats.elapsedMs / 1000).toFixed(1)}s, ` +
+    `${stats.steps} blocks, ` +
+    `${stats.measureFailures} undecodable, ` +
+    `${stats.unassisted} unassisted instructions, ` +
+    `budget left ${stats.budget}`
+  );
+}
+
 export function unassistedAllowance(
   remaining: number,
   alreadyRun: number,
@@ -396,11 +443,32 @@ export class Machine {
   private run(start: bigint): void {
     let address = start;
     let budget = INSTRUCTION_LIMIT;
+    const startedAt = Date.now();
+    let steps = 0;
+    let measureFailures = 0;
 
     while (budget > 0) {
+      // Checked once per block rather than per instruction: the block loop is
+      // where the work happens, and a guest that is looping shows up here as
+      // steps climbing while the budget barely moves.
+      steps++;
+      if (deadlineExceeded(startedAt, Date.now())) {
+        throw new Error(
+          `SAP guest call exceeded ${GUEST_CALL_DEADLINE_MS / 1000}s ` +
+            `(${describeGuestRun({
+              elapsedMs: Date.now() - startedAt,
+              steps,
+              measureFailures,
+              unassisted: this.unassisted,
+              budget,
+            })})`,
+        );
+      }
+
       const block = this.measure(address);
 
       if (!block) {
+        measureFailures++;
         // Undecodable: let the emulator run unassisted, but only up to a bound.
         // An unbounded run here is both silent and longer than the caller's
         // timeout, so it presents as a hang with nothing to report.
