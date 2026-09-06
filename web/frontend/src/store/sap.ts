@@ -47,7 +47,15 @@ interface SapStore {
    */
   setupStartedAt: number | null;
   /**
-   * Every setup step seen this session, oldest first.
+   * Why the previous attempt failed, kept across retries.
+   *
+   * A retry used to clear the error, so the one piece of evidence about the
+   * attempt that just died was erased by the act of trying again — and "the
+   * status line disappeared" was left with nothing behind it.
+   */
+  lastError: string | null;
+  /**
+   * Every setup step of the current attempt, oldest first.
    *
    * Setup is minutes long and reports no progress, so after the fact the only
    * evidence of what happened is this list. Bounded, because a session can
@@ -74,18 +82,25 @@ export const useSapStore = create<SapStore>((set) => ({
   stage: "idle",
   percent: null,
   setupStartedAt: null,
+  lastError: null,
   events: [],
   error: null,
   hardwareID: null,
 
+  // A new attempt starts from nothing. The events used to survive, so the
+  // next report mixed two attempts and measured its timeline from the first
+  // event of the previous one — which read as a step starting 118 seconds
+  // into a setup that was 13 seconds old.
   begin: (hardwareID) =>
-    set({
+    set((state) => ({
       stage: "assets",
       percent: 0,
       setupStartedAt: null,
+      events: [],
+      lastError: state.error ?? state.lastError,
       error: null,
       hardwareID,
-    }),
+    })),
   setInstalling: () => set({ stage: "installing", percent: null }),
   setAssets: (percent) => set({ stage: "assets", percent }),
   // Timestamped once, on entry. Re-entering the stage is a fresh setup and

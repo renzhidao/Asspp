@@ -32,7 +32,7 @@ export default function DiagnosticsModal({
 }) {
   const { t, i18n } = useTranslation();
   const accounts = useAccountsStore((state) => state.accounts);
-  const { stage, percent, error, hardwareID, setupStartedAt, events } =
+  const { stage, percent, error, hardwareID, setupStartedAt, events, lastError } =
     useSapStore();
   const addToast = useToastStore((state) => state.addToast);
 
@@ -95,6 +95,7 @@ export default function DiagnosticsModal({
                 : Math.round((Date.now() - setupStartedAt) / 1000),
             events,
             error,
+            lastError,
             hardwareID: maskHardwareID(hardwareID),
           },
           accounts,

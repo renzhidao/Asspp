@@ -77,9 +77,11 @@ export interface DiagnosticsInput {
      * into a wait that has no other observable the reader is.
      */
     setupSeconds: number | null;
-    /** Every setup step seen this session, oldest first. */
+    /** Every setup step of the current attempt, oldest first. */
     events: SapEvent[];
     error: string | null;
+    /** Why the previous attempt failed, if it did. */
+    lastError?: string | null;
     /** Masked before it gets here; see maskHardwareID. */
     hardwareID: string | null;
   };
@@ -282,6 +284,14 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
   if (input.signer.error) {
     out.push("  error:");
     for (const part of String(input.signer.error).split("\n")) {
+      out.push(`    ${part}`);
+    }
+  }
+  // Kept across retries: a status line that vanishes and a fresh attempt that
+  // looks clean are indistinguishable without it.
+  if (input.signer.lastError) {
+    out.push("  previousAttemptFailed:");
+    for (const part of String(input.signer.lastError).split("\n")) {
       out.push(`    ${part}`);
     }
   }
