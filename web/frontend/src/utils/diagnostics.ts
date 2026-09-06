@@ -1,5 +1,6 @@
 import type { Account } from "../types";
 import type { SapStage } from "../store/sap";
+import type { ActivityEntry } from "../store/activity";
 
 // Collects everything needed to diagnose a failed sign-in into one block of
 // text that can be pasted into an issue.
@@ -65,6 +66,8 @@ export interface DiagnosticsInput {
   serverError?: string | null;
   sapAssets?: SapAssetsStatus | null;
   sapAssetsError?: string | null;
+  /** What the app tried to do recently, newest last. */
+  activity?: ActivityEntry[];
   signer: {
     stage: SapStage;
     percent: number | null;
@@ -307,6 +310,25 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
         `hasPassword=${account.password ? "yes" : "no"}  ` +
         `guid=${maskHardwareID(account.deviceIdentifier) ?? "-"}`,
     );
+  }
+
+  // Without this a report from a failed download says nothing about the
+  // download.
+  out.push("");
+  out.push("[activity]");
+  const activity = input.activity ?? [];
+  if (activity.length === 0) {
+    out.push("  none recorded");
+  } else {
+    for (const entry of activity) {
+      const took =
+        typeof entry.tookMs === "number" ? ` ${(entry.tookMs / 1000).toFixed(1)}s` : "";
+      const mark = entry.ok ? "ok" : "FAILED";
+      const detail = entry.detail ? ` — ${entry.detail}` : "";
+      out.push(
+        `  ${new Date(entry.at).toISOString()}  ${entry.kind}  ${entry.target}  ${mark}${took}${detail}`,
+      );
+    }
   }
 
   return out.join("\n");

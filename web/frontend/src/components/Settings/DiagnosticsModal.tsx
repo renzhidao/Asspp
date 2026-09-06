@@ -5,6 +5,7 @@ import Spinner from "../common/Spinner";
 import { apiGet } from "../../api/client";
 import { useAccountsStore } from "../../store/accounts";
 import { useSapStore } from "../../store/sap";
+import { useActivityStore } from "../../store/activity";
 import {
   buildDiagnostics,
   maskHardwareID,
@@ -34,6 +35,7 @@ export default function DiagnosticsModal({
   const accounts = useAccountsStore((state) => state.accounts);
   const { stage, percent, error, hardwareID, setupStartedAt, events, lastError } =
     useSapStore();
+  const activity = useActivityStore((s) => s.entries);
   const addToast = useToastStore((state) => state.addToast);
 
   const [report, setReport] = useState<string | null>(null);
@@ -86,6 +88,7 @@ export default function DiagnosticsModal({
           serverError,
           sapAssets,
           sapAssetsError,
+          activity,
           signer: {
             stage,
             percent,

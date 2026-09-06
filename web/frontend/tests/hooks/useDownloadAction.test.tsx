@@ -37,6 +37,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 const { useDownloadAction } = await import("../../src/hooks/useDownloadAction");
+const { useActivityStore } = await import("../../src/store/activity");
 
 const account = {
   email: "richard@example.com",
@@ -66,6 +67,7 @@ describe("downloading an app the account has no licence for", () => {
     purchaseApp.mockReset();
     authenticate.mockReset();
     apiPost.mockClear();
+    useActivityStore.setState({ entries: [] });
   });
 
   it("acquires the licence and carries on", async () => {
@@ -146,5 +148,43 @@ describe("acquiring a licence", () => {
     await expect(result.current.acquireLicense(account, app)).rejects.toThrow();
 
     expect(authenticate).not.toHaveBeenCalled();
+  });
+});
+
+// The report used to say nothing about a failed download, so there was nothing
+// to diagnose it from.
+describe("recording what was tried", () => {
+  beforeEach(() => {
+    getDownloadInfo.mockReset();
+    purchaseApp.mockReset();
+    authenticate.mockReset();
+    apiPost.mockClear();
+    useActivityStore.setState({ entries: [] });
+  });
+
+  it("records a download that failed and why", async () => {
+    getDownloadInfo.mockRejectedValue(new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "x"));
+
+    const { result } = renderHook(() => useDownloadAction());
+    await expect(result.current.startDownload(account, app)).rejects.toThrow();
+
+    const entries = useActivityStore.getState().entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0].kind).toBe("download");
+    expect(entries[0].target).toBe("Candy Crush Saga");
+    expect(entries[0].ok).toBe(false);
+    expect(entries[0].detail).toContain("响应中没有项目");
+  });
+
+  it("records a licence that worked", async () => {
+    purchaseApp.mockResolvedValue({ updatedCookies: [] });
+
+    const { result } = renderHook(() => useDownloadAction());
+    await result.current.acquireLicense(account, app);
+
+    const entries = useActivityStore.getState().entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0].kind).toBe("license");
+    expect(entries[0].ok).toBe(true);
   });
 });

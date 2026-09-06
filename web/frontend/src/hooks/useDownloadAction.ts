@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { useAccounts } from "./useAccounts";
 import { useToastStore } from "../store/toast";
+import { useActivityStore } from "../store/activity";
 import { useDownloadsStore } from "../store/downloads";
 import { getDownloadInfo, DownloadError } from "../apple/download";
 import { purchaseApp, PurchaseError } from "../apple/purchase";
@@ -18,6 +19,7 @@ import type { Account, Software } from "../types";
 export function useDownloadAction() {
   const { updateAccount } = useAccounts();
   const addToast = useToastStore((s) => s.addToast);
+  const recordActivity = useActivityStore((s) => s.record);
   const fetchTasks = useDownloadsStore((s) => s.fetchTasks);
   const { t } = useTranslation();
 
@@ -28,6 +30,30 @@ export function useDownloadAction() {
   ) {
     const ctx = getAccountContext(account, t);
     const appName = app.name;
+    const beganAt = Date.now();
+
+    try {
+      await runDownload(account, app, versionId, appName, ctx);
+      recordActivity({ kind: "download", target: appName, ok: true, tookMs: Date.now() - beganAt });
+    } catch (error) {
+      recordActivity({
+        kind: "download",
+        target: appName,
+        ok: false,
+        detail: getErrorMessage(error, "unknown"),
+        tookMs: Date.now() - beganAt,
+      });
+      throw error;
+    }
+  }
+
+  async function runDownload(
+    account: Account,
+    app: Software,
+    versionId: string | undefined,
+    appName: string,
+    ctx: ReturnType<typeof getAccountContext>,
+  ) {
 
     try {
       const settings = await apiGet<{ maxDownloadMB: number }>("/api/settings");
@@ -89,6 +115,29 @@ export function useDownloadAction() {
   async function acquireLicense(account: Account, app: Software) {
     const ctx = getAccountContext(account, t);
     const appName = app.name;
+    const beganAt = Date.now();
+
+    try {
+      await runLicense(account, app, appName, ctx);
+      recordActivity({ kind: "license", target: appName, ok: true, tookMs: Date.now() - beganAt });
+    } catch (error) {
+      recordActivity({
+        kind: "license",
+        target: appName,
+        ok: false,
+        detail: getErrorMessage(error, "unknown"),
+        tookMs: Date.now() - beganAt,
+      });
+      throw error;
+    }
+  }
+
+  async function runLicense(
+    account: Account,
+    app: Software,
+    appName: string,
+    ctx: ReturnType<typeof getAccountContext>,
+  ) {
 
     // Renewing the token used to happen first, unconditionally. authenticate()
     // begins with prepareSigner(), and the signer lives in worker memory, so

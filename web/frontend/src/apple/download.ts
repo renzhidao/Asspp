@@ -123,7 +123,22 @@ export async function getDownloadInfo(
 
     const songList = dict.songList as Record<string, any>[] | undefined;
     if (!songList || songList.length === 0) {
-      throw new DownloadError(i18n.t("errors.download.noItems"));
+      // Apple answered without a failureType and without an item. The answer
+      // is not empty — it says something about why there is nothing to give —
+      // and throwing it away turned every one of these into the same dead end.
+      // The storefront is the usual reason: the app is not licensable there.
+      const customerMessage = dict.customerMessage as string | undefined;
+      const keys = Object.keys(dict).filter((key) => key !== "dialog");
+      const evidence = [
+        customerMessage,
+        `store=${account.store}`,
+        `keys=${keys.join(",") || "none"}`,
+      ]
+        .filter(Boolean)
+        .join(" ");
+      throw new DownloadError(
+        `${i18n.t("errors.download.noItems")} (${evidence})`,
+      );
     }
 
     const item = songList[0];

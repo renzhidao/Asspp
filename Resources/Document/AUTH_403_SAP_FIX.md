@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十七个 commit：
+十八个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -475,6 +475,20 @@ const renewed = await authenticate(
 不必让用户先点另一个按钮。
 
 `0017`。
+
+## 报告里没有下载记录，因为诊断从来没记过
+
+`diagnostics.ts` 只覆盖 SAP：setup 步骤、资源、账号。搜索、获取许可证、下载一条都不记。
+一份「下载失败」的报告发过来，里面关于那次下载什么都没有。
+
+`0018` 加了一条有上限的活动日志（40 条，超出丢最旧的——出问题的是最近的），
+报告新增 `[activity]` 段，每行是时间、动作、对象、成败、耗时、原因。
+不含密码、token、cookie。
+
+同时把 `noItems` 这条死路补上了证据。`download.ts` 收到没有 `failureType`、
+`songList` 又是空的响应时，原来只抛「响应中没有项目」，把 Apple 的整段回答丢掉。
+现在带上 `customerMessage`、`store`（storefront）和响应里有哪些键——
+storefront 不对是最常见的原因，而这在原文案里完全看不出来。
 
 ## 我验证到了什么（全部本次实跑）
 
