@@ -105,3 +105,43 @@ describe("the report", () => {
     expect(report).toContain("none recorded");
   });
 });
+
+describe("a report built from the paired entries an older build recorded", () => {
+  // Verbatim from a field report: every step appears twice, once as a begin
+  // and once carrying its end, so the timeline printed each step on two lines
+  // and claimed every finished one was STILL RUNNING. stuckInStep was right —
+  // the begin and end of the final step share a label and a timestamp, so
+  // scanning back to either gives the same answer. The timeline was the
+  // defect, not the conclusion above it.
+  const T = Date.parse("2026-09-06T12:20:00.000Z");
+  const paired: SapEvent[] = [
+    { label: "machine.open", at: T },
+    { label: "machine.open", at: T, endedAt: T + 1300 },
+    { label: "machine.initialize", at: T + 1300 },
+    { label: "machine.initialize", at: T + 1300, endedAt: T + 74_200 },
+    { label: "certificate.fetch", at: T + 74_100 },
+    { label: "certificate.fetch", at: T + 74_100, endedAt: T + 74_600 },
+    { label: "exchange.1", at: T + 74_600 },
+  ];
+
+  it("still names the step actually in progress", () => {
+    expect(runningStep(paired)?.label).toBe("exchange.1");
+  });
+
+  it("prints one line per step, and marks only the running one", () => {
+    const report = buildDiagnostics(input(paired, 140));
+
+    expect(report).toContain("stuckInStep: exchange.1 for");
+    expect(report).toContain("machine.open  +0.0s  took 1.3s");
+    expect(report).toContain("machine.initialize  +1.3s  took 72.9s");
+    expect(report).toContain("certificate.fetch  +74.1s  took 0.5s");
+    expect(report).toContain("exchange.1  +74.6s  STILL RUNNING");
+
+    // One line per step: the duplication was the whole defect.
+    const stepLines = report
+      .split("\n")
+      .filter((entry) => /^  \S+  \+\d/.test(entry));
+    expect(stepLines).toHaveLength(4);
+    expect(report.match(/STILL RUNNING/g)).toHaveLength(1);
+  });
+});

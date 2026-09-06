@@ -107,10 +107,11 @@ export function maskHardwareID(id: string | null): string | null {
 /**
  * The step setup is in right now, or null if every recorded step has ended.
  *
- * The list is chronological and a step's end arrives as a second entry for the
- * same label, so the last entry that has no `endedAt` is the one still running.
- * That single value is what turns "stage: setup" — which says only that
- * something is happening — into an answer.
+ * The last entry with no `endedAt` is the step still running. Its begin and
+ * end carry the same label and the same start timestamp, so scanning back to
+ * the begin entry of the final step gives the same answer as the end would —
+ * which is what turns "stage: setup", which says only that something is
+ * happening, into an answer.
  */
 export function runningStep(events: SapEvent[]): SapEvent | null {
   for (let index = events.length - 1; index >= 0; index--) {
@@ -131,13 +132,40 @@ function setupTimeline(events: SapEvent[]): string[] {
   if (events.length === 0) return ["  none recorded"];
 
   const startedAt = events[0].at;
-  const at = (timestamp: number) => `+${((timestamp - startedAt) / 1000).toFixed(1)}s`;
+  const at = (timestamp: number) =>
+    `+${((timestamp - startedAt) / 1000).toFixed(1)}s`;
 
-  return events.map((event) =>
-    event.endedAt !== undefined
-      ? `  ${event.label}  ${at(event.at)}  took ${((event.endedAt - event.at) / 1000).toFixed(1)}s`
-      : `  ${event.label}  ${at(event.at)}  STILL RUNNING`,
-  );
+  // One line per step. Where a begin and an end were recorded as separate
+  // entries, the end is the one worth printing; a begin with nothing after it
+  // is the step still in progress.
+  const lines: string[] = [];
+  for (let index = 0; index < events.length; index++) {
+    const event = events[index];
+    const supersededBy = events.findIndex(
+      (later, position) => position > index && later.label === event.label,
+    );
+
+    if (supersededBy !== -1) {
+      const end = events[supersededBy];
+      index = supersededBy;
+      if (end.endedAt === undefined) {
+        lines.push(`  ${end.label}  ${at(end.at)}  STILL RUNNING`);
+        continue;
+      }
+      lines.push(
+        `  ${end.label}  ${at(end.at)}  took ${((end.endedAt - end.at) / 1000).toFixed(1)}s`,
+      );
+      continue;
+    }
+
+    lines.push(
+      event.endedAt !== undefined
+        ? `  ${event.label}  ${at(event.at)}  took ${((event.endedAt - event.at) / 1000).toFixed(1)}s`
+        : `  ${event.label}  ${at(event.at)}  STILL RUNNING`,
+    );
+  }
+
+  return lines;
 }
 
 function line(label: string, value: unknown): string {

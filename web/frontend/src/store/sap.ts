@@ -101,9 +101,28 @@ export const useSapStore = create<SapStore>((set) => ({
   setError: (message) =>
     set({ stage: "error", percent: null, setupStartedAt: null, error: message }),
   recordEvent: (event) =>
-    set((state) => ({
-      events: [...state.events, event].slice(-MAX_EVENTS),
-    })),
+    set((state) => {
+      // A step's end arrives as a second event for the same label. Folding it
+      // into the entry already there keeps one line per step; appending it
+      // instead left the begin entry behind, so the list read as though every
+      // finished step were also still running.
+      //
+      // Only the trailing open entry for that label is folded, so a signer
+      // rebuilt mid-session appends a fresh machine.open rather than editing
+      // the recorded cost of the first one.
+      for (let index = state.events.length - 1; index >= 0; index--) {
+        const existing = state.events[index];
+        if (existing.label !== event.label) continue;
+        if (existing.endedAt === undefined && event.endedAt !== undefined) {
+          const folded = state.events.slice();
+          folded[index] = { ...existing, endedAt: event.endedAt };
+          return { events: folded };
+        }
+        break;
+      }
+
+      return { events: [...state.events, event].slice(-MAX_EVENTS) };
+    }),
 }));
 
 /** A human-readable line for the current stage, or null when there is nothing to say. */

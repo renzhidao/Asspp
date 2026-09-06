@@ -9,9 +9,9 @@
 | 路径 | 内容 |
 | --- | --- |
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 9 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `Resources/Document/patches/` | 同样 10 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-九个 commit：
+十个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -23,6 +23,7 @@
 0007 Show elapsed time while the signer is being set up        ← 本次新增
 0008 Fail an abandoned SAP setup instead of orphaning it       ← 本次新增
 0009 Report which setup step is running, and on what hardware  ← 本次新增
+0010 Record one setup step per line                            ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -286,6 +287,42 @@ if (ready) reset(new Error("SAP signer rebuilt for a different device"));
 事件里只放**步骤名**，不放 URL、不放 setup buffer（那是不透明的握手数据），
 硬件号仍然只留前缀。报告开头那句「不含凭据」的承诺不变。
 
+## 第一份带时间线的报告：慢，但在推进
+
+第四份报告（`buildCommit: 66252e79`，8 核 / 8 GB Android 10 / Chrome 142）第一次
+给出了每步耗时：
+
+| 步骤 | 耗时 | 说明 |
+|---|---|---|
+| `machine.open` | **1.3 s** | 38 MB 装载正常 |
+| `machine.initialize` | **72.9 s** | 慢，但完成（桌面 Chrome 约 60 s） |
+| `certificate.fetch` | **0.5 s** | **服务端到 Apple 的网络正常** |
+| `exchange.1` | 报告时已跑 **65 s**，仍在进行 | 仿真 |
+
+结论：不是卡死、不是网络、不是内存不足，就是这台设备的仿真比桌面慢。按桌面比例
+推算整个 setup 约 160–200 s。
+
+## 时间线一步打了两行（`0010`）
+
+同一份报告里，每一步都出现两次：
+
+```
+machine.open  +0.0s  STILL RUNNING
+machine.open  +0.0s  took 1.3s      ← 同一步，自相矛盾
+```
+
+原因是 store 对每步存了**两条**记录（开始一条、结束一条），时间线逐条打印。
+`0010` 让结束事件**折进**已存在的那条，同时时间线也能正确消化成对条目。
+只有「末尾那条同名开放记录」会被折叠，所以签名器中途重建时新的一次
+`machine.open` 会另起一行，不会覆盖上一次记下的耗时。
+
+**需要更正我上一轮的一句话。** 我当时说 `runningStep`「永远认为有步骤在跑」，
+并把「`stuckInStep` 报了早就结束的 `machine.open`」当成症状。这是错的：我把你
+数据里的 `exchange.1` 误读成了 `machine.open`。实测把这份数据喂给 `66252e79`
+的真实代码，`runningStep` 返回的就是 `exchange.1` —— 正确。最后一步的 begin 和
+end 同名同时间戳，倒着扫到哪条都给出同一个答案。**`stuckInStep` 没有骗人，
+只有时间线在重复打印。** 那个多余的改动已撤销，为它写的测试也一并修正。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -293,14 +330,16 @@ if (ready) reset(new Error("SAP signer rebuilt for a different device"));
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **134 passed / 19 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、6 个 setup 时间线测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
+| 前端测试 | `frontend` `npm test` | **139 passed / 20 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **九个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **十个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 单行记录真抓得住错 | 把时间线改回逐条打印 | 1 个失败：`expected [ …(7) ] to have a length of 4 but got 7` |
+| store 折叠真抓得住错 | 把 `recordEvent` 改回无条件追加 | 3 个失败，其中 `expected [ …(3) ] to have a length of 2 but got 3` |
 | 时间线真抓得住错 | 把配对逻辑写成「找另一条同名结束条目」 | 2 个失败：`machine.open` 明明结束了却报 `STILL RUNNING` |
 | 计时器真抓得住「静止的屏幕」 | 把计时逻辑拆掉再跑测试 | 2 个失败：`to contain 'setupElapsed'`、`to contain '"seconds":5'` |
 | 孤儿 Promise 真抓得住 | 把 `reset()` 里那句 reject 删掉再跑 | 测试**超时 15 秒** —— Promise 永不结算，正是界面上那个永久转圈 |
