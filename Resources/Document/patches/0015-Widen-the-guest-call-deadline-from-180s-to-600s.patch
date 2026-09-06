@@ -1,0 +1,81 @@
+From d7a1294df85e92e10b2f33612751e8ad7c9226df Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 15:14:48 +0000
+Subject: [PATCH] Widen the guest call deadline from 180s to 600s
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+180s was set against the measured figures — 35s in WebKit, 63s in Node, 115s in
+desktop Chrome — with room to spare. But it is a ceiling on a legitimate call,
+and a machine slower than any of those, or one under memory pressure, would
+have a working setup cut short. Killing a setup that was going to finish is a
+worse outcome than waiting on one that was not.
+
+600s still lands inside the caller's own 15 minute timeout, so a genuine hang
+is still reported with its statistics rather than as a bare timeout, which is
+the reason the deadline exists.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/sap/machine.ts          | 17 +++++++++++------
+ frontend/tests/apple/guestDeadline.test.ts | 15 +++++++++++++--
+ 2 files changed, 24 insertions(+), 8 deletions(-)
+
+diff --git a/frontend/src/apple/sap/machine.ts b/frontend/src/apple/sap/machine.ts
+index 40bd355..8931c04 100644
+--- a/frontend/src/apple/sap/machine.ts
++++ b/frontend/src/apple/sap/machine.ts
+@@ -68,12 +68,17 @@ const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
+  */
+ // How long one guest call may take before it is called a failure.
+ //
+-// A desktop finishes the entire setup in 115 seconds, so one call there is
+-// well under two minutes. The phone in the field reports runs at 1.2x that.
+-// Anything past three minutes for a single call is not a slow device, it is a
+-// guest that is not making progress — and the caller's own 15 minute timeout
+-// is far too blunt to say anything about why.
+-const GUEST_CALL_DEADLINE_MS = 180_000;
++// Measured upstream: setup is 35 s in WebKit, 63 s in Node and 115 s in desktop
++// Chrome, and the slowest device seen in the field runs at about 1.2x that. So
++// a legitimate call is well inside a minute and a half even there.
++//
++// This was 180 s, which is not enough margin: a machine slower than any of
++// those, or one under memory pressure, could have a legitimate call cut short,
++// and cutting a working setup is worse than waiting for one that is not. Ten
++// minutes still lands well inside the caller's own 15 minute timeout, so a
++// genuine hang is reported with its statistics rather than as a bare timeout —
++// which is the whole reason this exists — without risking a slow machine.
++const GUEST_CALL_DEADLINE_MS = 600_000;
+ 
+ export interface GuestRunStats {
+   /** Wall-clock milliseconds since the call began. */
+diff --git a/frontend/tests/apple/guestDeadline.test.ts b/frontend/tests/apple/guestDeadline.test.ts
+index 7b916c6..9d76724 100644
+--- a/frontend/tests/apple/guestDeadline.test.ts
++++ b/frontend/tests/apple/guestDeadline.test.ts
+@@ -18,8 +18,19 @@ describe("deadlineExceeded", () => {
+     expect(deadlineExceeded(T0, T0 + 120_000)).toBe(false);
+   });
+ 
+-  it("fires past three minutes", () => {
+-    expect(deadlineExceeded(T0, T0 + 180_001)).toBe(true);
++  it("gives a slow machine room rather than cutting a working setup short", () => {
++    // Three minutes turned out to be too little margin: a machine slower than
++    // any of the measured ones would have had a legitimate call killed, and
++    // cutting a working setup is worse than waiting for a hung one.
++    expect(deadlineExceeded(T0, T0 + 300_000)).toBe(false);
++    expect(deadlineExceeded(T0, T0 + 599_000)).toBe(false);
++  });
++
++  it("still fires before the caller's own 15 minute timeout", () => {
++    // The point of the deadline is that a hang is reported with statistics
++    // instead of as a bare timeout, so it has to land inside 900s.
++    expect(deadlineExceeded(T0, T0 + 600_001)).toBe(true);
++    expect(600_000).toBeLessThan(15 * 60 * 1000);
+   });
+ 
+   it("accepts an explicit limit", () => {
+-- 
+2.39.5
+
