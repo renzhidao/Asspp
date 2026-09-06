@@ -95,6 +95,15 @@ function reset(error: Error) {
   for (const waiter of pending.values()) waiter.reject(error);
   pending.clear();
 
+  // The setup promise is not in `pending` — it is settled through
+  // settleSetup — so it has to be failed here explicitly. Without this, a
+  // setup abandoned mid-way leaves its caller waiting on a promise nothing
+  // will ever resolve, and the screen sits on "initialising the signer" until
+  // the 15 minute guard fires.
+  const abandoned = settleSetup;
+  settleSetup = null;
+  abandoned?.reject(error);
+
   worker?.terminate();
   worker = null;
   ready = null;
@@ -117,6 +126,7 @@ export function prepareSigner(
   onProgress = progress ?? null;
 
   if (ready && preparedFor === hardwareID) return ready;
+
   if (ready) reset(new Error("SAP signer rebuilt for a different device"));
 
   preparedFor = hardwareID;

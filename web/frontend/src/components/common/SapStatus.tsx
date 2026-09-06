@@ -20,6 +20,7 @@ export default function SapStatus() {
   const stage = useSapStore((state) => state.stage);
   const percent = useSapStore((state) => state.percent);
   const error = useSapStore((state) => state.error);
+  const setupStartedAt = useSapStore((state) => state.setupStartedAt);
 
   // Setting a signer up is a long, single-threaded wait inside the worker, and
   // the worker cannot report from inside it — so from outside it is
@@ -27,21 +28,28 @@ export default function SapStatus() {
   // real numbers to show; this one has none, so it counts up instead. A number
   // that moves is the only honest "still working" available here, and the wait
   // is long enough that a fixed estimate reads as a hang once it is passed.
-  const [elapsed, setElapsed] = useState(0);
+  //
+  // The start comes from the store rather than from mounting, so navigating
+  // away and back shows how long the setup has really been running instead of
+  // restarting the count — on a phone this wait runs to many minutes, and a
+  // clock that reads zero again says the opposite of the truth.
+  const [elapsed, setElapsed] = useState(() =>
+    setupStartedAt === null ? 0 : Math.round((Date.now() - setupStartedAt) / 1000),
+  );
 
   useEffect(() => {
-    if (stage !== "setup") {
+    if (stage !== "setup" || setupStartedAt === null) {
       setElapsed(0);
       return;
     }
 
-    const startedAt = Date.now();
+    setElapsed(Math.round((Date.now() - setupStartedAt) / 1000));
     const timer = setInterval(
-      () => setElapsed(Math.round((Date.now() - startedAt) / 1000)),
+      () => setElapsed(Math.round((Date.now() - setupStartedAt) / 1000)),
       1000,
     );
     return () => clearInterval(timer);
-  }, [stage]);
+  }, [stage, setupStartedAt]);
 
   if (stage === "idle" || stage === "ready") return null;
 

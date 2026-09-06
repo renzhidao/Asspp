@@ -44,6 +44,15 @@ export interface DiagnosticsInput {
   signer: {
     stage: SapStage;
     percent: number | null;
+    /**
+     * How long the setup stage has been running, or null outside it.
+     *
+     * Setup is the one stage with no progress to report, and the only
+     * measurements of it are on desktop and in Node — so "is it stuck?" cannot
+     * be answered from the stage name alone. The elapsed time says how far
+     * into a wait that has no other observable the reader is.
+     */
+    setupSeconds: number | null;
     error: string | null;
     /** Masked before it gets here; see maskHardwareID. */
     hardwareID: string | null;
@@ -149,6 +158,12 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
   out.push("[signer]");
   out.push(line("  stage", input.signer.stage));
   out.push(line("  percent", input.signer.percent));
+  out.push(
+    line(
+      "  setupSeconds",
+      input.signer.setupSeconds === null ? null : input.signer.setupSeconds,
+    ),
+  );
   out.push(line("  hardwareID", input.signer.hardwareID));
   if (input.signer.error) {
     out.push("  error:");

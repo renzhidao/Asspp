@@ -9,9 +9,9 @@
 | 路径 | 内容 |
 | --- | --- |
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 7 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `Resources/Document/patches/` | 同样 8 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-七个 commit：
+八个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -21,6 +21,7 @@
 0005 Add a diagnostics report that needs no console            ← 本次新增
 0006 Report SAP asset progress honestly                        ← 本次新增
 0007 Show elapsed time while the signer is being set up        ← 本次新增
+0008 Fail an abandoned SAP setup instead of orphaning it       ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -210,6 +211,41 @@ ARM 设备跑 unicorn.js 的 WebAssembly，上面三个数字都不适用，而�
 屏幕上的数字每秒动一次，是「还在跑」唯一诚实的证据；文案也改成
 「首次约 1 分钟，手机上会明显更久」。离开 `setup` 阶段时计时器清掉。
 
+## 登录会永久卡住：被丢弃的 setup 从来没有被失败掉
+
+第三份报告（`buildCommit: 22227b2e`）：`stage: setup`、已经 500 多秒、没有报错，
+并且**切换到别的页面再回来，秒数从头开始计**。这两件事都指向同一个真 bug。
+
+`AddAccountForm.tsx` 的设备号是 `useState(() => generateDeviceId())` —— **每次组件挂载
+都重新随机生成**，所以「切走再切回」会拿到一个不同的设备号。签名器是绑死设备号的，
+于是 `prepareSigner()` 走进重建分支：
+
+```ts
+if (ready) reset(new Error("SAP signer rebuilt for a different device"));
+```
+
+`reset()` 里 reject 了 `pending`（那是**签名**请求），但 setup 的等待者是放在
+`settleSetup` 里的，`reset()` 压根没碰它 —— 它只把 `ready = null`。
+调用方 `authenticate()` 手上那个 Promise **永远不会结算**。
+
+于是：登录请求挂在那儿，界面停在「正在初始化签名器」，`onerror` 不触发
+（worker 是被 `terminate()` 正常终止的，不算错误），只有 15 分钟的
+`SETUP_TIMEOUT_MS` 会最终把它叫醒。**这就是 500 多秒什么都不发生的机制。**
+
+`0008` 修三处：
+
+1. `reset()` 现在显式失败 `settleSetup`，被丢弃的 setup 会立刻报错而不是永远悬着。
+2. 计时起点从组件内 `Date.now()` 移到 store 的 `setupStartedAt`，切页面不再归零 ——
+   一个已经跑了 9 分钟的等待，不该在回来时显示成 0 秒。
+3. 诊断报告新增 `setupSeconds` 一行。setup 是唯一没有百分比的阶段，而现有量测都在
+   桌面和 Node 上，光看 `stage: setup` 无法回答「是不是卡了」——这正是前两份报告
+   来问的问题。
+
+顺带说明一个**没有**修的东西：设备号每次挂载重新生成，本身是有意设计（每个账号一个
+设备标识，表单上还有手动「换一个」按钮）。它意味着切页面必然重建签名器、重跑一次
+完整 setup。修掉第 1 点之后这不再是永久卡死，但仍是一次白等。要不要把设备号持久化
+是个产品决定，我没有擅自改。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -217,15 +253,17 @@ ARM 设备跑 unicorn.js 的 WebAssembly，上面三个数字都不适用，而�
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **123 passed / 15 files**（基线 96；新增 3 个签名测试、13 个诊断构建测试、6 个诊断弹窗/SAP 状态渲染测试、5 个进度语义测试） |
+| 前端测试 | `frontend` `npm test` | **128 passed / 18 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **七个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **八个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
 | 计时器真抓得住「静止的屏幕」 | 把计时逻辑拆掉再跑测试 | 2 个失败：`to contain 'setupElapsed'`、`to contain '"seconds":5'` |
+| 孤儿 Promise 真抓得住 | 把 `reset()` 里那句 reject 删掉再跑 | 测试**超时 15 秒** —— Promise 永不结算，正是界面上那个永久转圈 |
+| 计时起点真抓得住 | 把起点改回组件内 `Date.now()` 再跑 | 1 个失败：`expected +0 to be 120` |
 | 进度修复真抓得住 bug | 把累加逻辑还原成旧写法再跑测试 | 3 个失败，其中 `expected 100 to be less than 50` —— 正是日志里那个 100% |
 | 既有缺陷 | `DiagnosticsModal` 的 toast mock | 原本每轮都留一个 `addToast is not a function` 未处理拒绝，已修 |
 | 诊断按钮真渲染 | 组件测试 + 打印真实输出 | 弹窗渲染、两个接口都被调用、剪贴板收到内容、且内容不含凭据 |

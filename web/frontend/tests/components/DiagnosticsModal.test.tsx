@@ -135,7 +135,9 @@ describe("DiagnosticsModal", () => {
     // inside one long blocking call that cannot report from within. Nothing
     // else on screen moves, so without a counter this is indistinguishable
     // from a dead tab.
-    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
+    // Through setSetup(), not by hand: the start of the count is state now, so
+    // a test that bypasses the setter would be testing a screen no user sees.
+    useSapStore.getState().setSetup();
 
     vi.useFakeTimers();
     try {
@@ -165,7 +167,9 @@ describe("DiagnosticsModal", () => {
   });
 
   it("stops counting once the signer leaves the setup stage", () => {
-    useSapStore.setState({ stage: "setup", percent: null, error: null, hardwareID: "a1b2" } as any);
+    // Through setSetup(), not by hand: the start of the count is state now, so
+    // a test that bypasses the setter would be testing a screen no user sees.
+    useSapStore.getState().setSetup();
 
     vi.useFakeTimers();
     try {

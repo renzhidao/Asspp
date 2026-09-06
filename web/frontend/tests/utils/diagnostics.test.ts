@@ -50,13 +50,43 @@ function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
       progress: { stage: "locating", found: [] },
       error: null,
     },
-    signer: { stage: "assets", percent: 42, error: null, hardwareID: "a1b2…" },
+    signer: {
+      stage: "assets",
+      percent: 42,
+      setupSeconds: null,
+      error: null,
+      hardwareID: "a1b2…",
+    },
     accounts: [account],
     language: "zh-CN",
     now: new Date("2026-09-06T08:00:00.000Z"),
     ...overrides,
   };
 }
+
+it("reports how long setup has been running, because the stage name cannot", () => {
+  // Setup is the one stage with no percentage, and the only published timings
+  // for it are desktop and Node. A report saying stage: setup alone leaves
+  // "is it stuck?" unanswerable, which is exactly the question two field
+  // reports arrived asking.
+  const running = buildDiagnostics(
+    input({
+      signer: {
+        stage: "setup",
+        percent: null,
+        setupSeconds: 512,
+        error: null,
+        hardwareID: "a1b2…",
+      },
+    }),
+  );
+  expect(running).toContain("setupSeconds: 512");
+
+  // Outside the stage there is nothing to report, and 0 would read as
+  // "a setup that just began" rather than "no setup in progress".
+  const idle = buildDiagnostics(input());
+  expect(idle).toContain("setupSeconds: -");
+});
 
 describe("masking", () => {
   it("keeps enough of an email to tell accounts apart and no more", () => {
@@ -160,6 +190,7 @@ describe("buildDiagnostics", () => {
         signer: {
           stage: "error",
           percent: null,
+          setupSeconds: null,
           error: "timed out preparing the SAP signer",
           hardwareID: "a1b2…",
         },
