@@ -158,9 +158,21 @@ export async function getDownloadInfo(
             ? "empty"
             : String(dict.failureType);
       const keys = Object.keys(dict).filter((key) => key !== "dialog");
+      // Guessing has produced four wrong answers, so this carries the whole
+      // exchange instead: what was asked, where, and what came back. The
+      // response keys say cancel-purchase-batch and m-allowed, which is the
+      // shape of a purchase answer, not of a download one — and the only way
+      // to settle which endpoint actually refused is to print both sides.
+      // A failure response has no songList, so there is no download URL in it
+      // to leak; it is truncated regardless.
+      const dump = String(response.body ?? "").replace(/\s+/g, " ").slice(0, 600);
       throw new DownloadError(
         `${customerMessage ?? i18n.t("errors.download.noItems")} ` +
-          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"})`,
+          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"} ` +
+          `http=${response.status} ` +
+          `endpoint=${requestHost}${requestPath.split("?")[0]} ` +
+          `sent=${Object.keys(payload).join(",")} ` +
+          `resp=${dump})`,
         typeof dict.failureType === "string" && dict.failureType
           ? dict.failureType
           : undefined,

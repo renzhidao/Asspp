@@ -108,3 +108,25 @@ describe("the volumeStore payload", () => {
     expect(sent.body).toContain("<string>0</string>");
   });
 });
+
+// Four hypotheses have been wrong. This asserts the report carries the whole
+// exchange, which is what settles the next one without another guess.
+describe("the failure report", () => {
+  beforeEach(() => appleRequest.mockReset());
+
+  it("carries the endpoint, the status, what was sent and what came back", async () => {
+    respond({ failureType: "", customerMessage: "App Not Available" });
+
+    const error = await getDownloadInfo(account, app).catch((e) => e);
+
+    expect(error.message).toContain("endpoint=");
+    expect(error.message).toContain("volumeStoreDownloadProduct");
+    expect(error.message).toContain("http=200");
+    // Proof of what actually went out — the one thing that has been assumed
+    // rather than shown this whole time.
+    expect(error.message).toContain("sent=");
+    expect(error.message).toContain("serialNumber");
+    expect(error.message).toContain("resp=");
+    expect(error.message).toContain("App Not Available");
+  });
+});

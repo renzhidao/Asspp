@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-二十四个 commit：
+二十五个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -621,6 +621,34 @@ Web 版**一个都没有**。`grep -rn serialNumber src/` 在 `0023` 之前是 0
 `0024` 给三处 payload 都加上 `serialNumber: "0"`。
 
 **这一条是上游已合并的修法，不是我猜的。**
+
+**但它被证伪了。** 部署 `b324d1a` 后重试，仍然是
+`App Not Available (code=empty)`。PR #500 修的是 `5002`，不是这个 —— 我拿一个
+治另一种病的修法当成了这个病的。
+
+### 被证伪的假设清单
+
+| 假设 | 证伪依据 |
+|---|---|
+| 解码器读不出块（`0011`） | 报告 `0 undecodable` |
+| 无界 `emu_start`（`0011`） | 报告 `0 unassisted instructions` |
+| 有数字码被丢在 `purchase.ts`（`0019`） | 那句话不是从那里抛的 |
+| 有数字码被丢在 `download.ts` default 分支（`0021`） | 那个分支也没进 |
+| **数字码存在** | `code=empty` —— 键在，值是空串 |
+| 端点与 ipatool 不同（`MZBuy.woa`） | 官方 ipatool 是 `MZFinance.woa`，与 Web 版相同；`MZBuy` 来自第三方 fork |
+| 缺 `serialNumber`（`0024`） | 加了之后错误一字不变 |
+
+### 还没有被解释的事实
+
+响应键是 `pings, metrics, failureType, customerMessage, m-allowed,
+cancel-purchase-batch`。`cancel-purchase-batch` 和 `m-allowed` 是**购买**响应的形状，
+不是 `volumeStoreDownloadProduct` 的。但抛错的是 `getDownloadInfo`，
+而 `handleDownload` 只调 `startDownload`，不调 `acquireLicense`
+（`ProductDetail.tsx:119-137`）。这两件事目前对不上。
+
+`0025` 不再猜：失败时把**整个交换**打印出来 —— 端点、HTTP 状态、实际发出的
+payload 键、以及响应原文（截断 600 字符）。失败响应里没有 `songList`，
+所以其中不含下载链接。
 
 ## 我验证到了什么（全部本次实跑）
 
