@@ -46,6 +46,35 @@ const MAX_BLOCK_INSTRUCTIONS = 32;
 // Enough bytes to decode MAX_BLOCK_INSTRUCTIONS of any encoding.
 const CODE_WINDOW = MAX_BLOCK_INSTRUCTIONS * 15;
 
+// How many instructions a block the decoder cannot read may run unassisted.
+//
+// The whole remaining budget used to be handed to one emu_start in that case.
+// Measured on an 8 GB Android phone, the guest runs at roughly twenty thousand
+// instructions a second, so a full 100M budget is an hour and a half inside a
+// single call — long past the client's 15 minute timeout, and silent for all of
+// it, because nothing can report from inside a running emulator. Capping it
+// turns that into an error naming the cause in about two minutes.
+//
+// Nothing that completes today is lost by the cap: a run needing more than
+// this unassisted already could not finish inside the timeout.
+const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
+
+/**
+ * How many instructions an unassisted run may take, and why it stops there.
+ *
+ * Split out from run() because run() drives the emulator and cannot be unit
+ * tested here, while the arithmetic that decides whether a guest is allowed to
+ * continue can be.
+ */
+export function unassistedAllowance(
+  remaining: number,
+  alreadyRun: number,
+): { allowed: number; exhausted: boolean } {
+  const room = UNASSISTED_INSTRUCTION_LIMIT - alreadyRun;
+  if (room <= 0) return { allowed: 0, exhausted: true };
+  return { allowed: Math.min(room, remaining), exhausted: false };
+}
+
 const CORE_EXPORT_NAMES = [
   "_WIn9UJ86JKdV4dM",
   "_X46O5IeS",
@@ -85,6 +114,8 @@ export class Machine {
 
   private scratchCursor = 0n;
   private closed = false;
+  /** Instructions run without the block splitter's help. See run(). */
+  private unassisted = 0;
 
   private constructor(engine: Engine, shims: Shims, entry: EntryPoints) {
     this.engine = engine;
@@ -370,10 +401,19 @@ export class Machine {
       const block = this.measure(address);
 
       if (!block) {
-        // Undecodable: let the emulator run unassisted, which is no worse
-        // than not splitting at all.
-        this.segment(address, budget, null);
-        budget = 0;
+        // Undecodable: let the emulator run unassisted, but only up to a bound.
+        // An unbounded run here is both silent and longer than the caller's
+        // timeout, so it presents as a hang with nothing to report.
+        const allowance = unassistedAllowance(budget, this.unassisted);
+        if (allowance.exhausted) {
+          throw new Error(
+            `SAP guest needed more than ${UNASSISTED_INSTRUCTION_LIMIT} unassisted instructions at 0x${address.toString(16)}`,
+          );
+        }
+
+        this.unassisted += allowance.allowed;
+        this.segment(address, allowance.allowed, null);
+        budget -= allowance.allowed;
       } else if (!block.complete) {
         // Too long to translate whole. Stop it at the last safe boundary and
         // resume from there; the guest cannot tell, only the translator can.

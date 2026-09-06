@@ -9,9 +9,9 @@
 | 路径 | 内容 |
 | --- | --- |
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
-| `Resources/Document/patches/` | 同样 10 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
+| `Resources/Document/patches/` | 同样 11 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十个 commit：
+十一个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -24,6 +24,7 @@
 0008 Fail an abandoned SAP setup instead of orphaning it       ← 本次新增
 0009 Report which setup step is running, and on what hardware  ← 本次新增
 0010 Record one setup step per line                            ← 本次新增
+0011 Bound the unassisted guest run so it fails, not hangs     ← 本次新增
 ```
 
 前三个来自 `Lakr233/AssppWeb` 的 draft PR **#88**（作者 Tardisyuan）。
@@ -323,6 +324,46 @@ machine.open  +0.0s  took 1.3s      ← 同一步，自相矛盾
 end 同名同时间戳，倒着扫到哪条都给出同一个答案。**`stuckInStep` 没有骗人，
 只有时间线在重复打印。** 那个多余的改动已撤销，为它写的测试也一并修正。
 
+## `exchange.1` 654 秒：不是慢，是撞上了没有上界的一次 `emu_start`
+
+第五份报告（同一台 8 核 / 8 GB Android 10，`buildCommit: 66252e79`）：
+
+```
+setupSeconds: 728
+stuckInStep: exchange.1 for 654s
+```
+
+同一台设备上 `machine.initialize` 是 72.9s，桌面约 60s，即 **1.2 倍**。
+桌面整个 setup 才 115s，`exchange.1` 按 1.2 倍应是 30–40s。**654s 是它的约 20 倍。**
+
+`machine.ts` 的 `run()` 里有这条分支：
+
+```ts
+if (!block) {
+  // Undecodable: let the emulator run unassisted…
+  this.segment(address, budget, null);   // budget 仍是 100_000_000
+  budget = 0;
+}
+```
+
+`measure()` 解不出这个指令块时（内存读不到，或解码器不认这条指令），
+**剩余全部预算被交给一次同步 `emu_start`**。按这台设备实测的
+`72.9s / 5.3M ≈ 2 万条/秒`，1 亿条 ≈ **83 分钟**；客户端超时是 15 分钟。
+所以在超时前它出不来，而且**全程无法上报**——从正在运行的仿真器内部发不出任何消息。
+
+`0011` 给这条路径封上 2,000,000 条的上界，超了就抛出点名原因的错误
+（`SAP guest needed more than 2000000 unassisted instructions at 0x…`），
+在这台设备上约 100 秒就会出结果，而不是静默 83 分钟。
+
+**这个上界不会让今天能跑通的路径失效**：需要超过 200 万条无辅助指令的 guest，
+本来也无法在 15 分钟超时内跑完。
+
+**未验证的部分（说清楚）**：这台设备到底是不是走了这条分支，我无法从外部证实——
+正因为从仿真器内部发不出消息。这个上界的作用是把它变成一个**会报错的诊断**：
+下一份报告若出现上面那句错误，就证实了；若 setup 正常跑完，说明嫌疑点判断错了，
+但也没有任何损失。`unassistedAllowance` 的算术有 4 个单元测试；
+`run()` 驱动真实仿真器的那一段**没有**测试，此环境没有 38 MB 真实二进制。
+
 ## 我验证到了什么（全部本次实跑）
 
 | 检查 | 命令 | 结果 |
@@ -330,14 +371,14 @@ end 同名同时间戳，倒着扫到哪条都给出同一个答案。**`stuckIn
 | 后端类型检查 | `backend` `npx tsc --noEmit` | **0 错误** |
 | 前端类型检查 | `frontend` `npx tsc --noEmit` | **1 错误**，在 `src/utils/crypto.ts:30`，**与 main 基线完全一致**（main 也是这 1 个），不是本次引入 |
 | 后端测试 | `backend` `npm test` | **68 passed / 8 files**（基线 49，新增 19 个 SAP 测试） |
-| 前端测试 | `frontend` `npm test` | **139 passed / 20 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
+| 前端测试 | `frontend` `npm test` | **143 passed / 21 files**（基线 96；新增 3 个签名测试、14 个诊断构建测试、8 个 setup 时间线测试、4 个 guest 预算测试、3 个 store 记录测试、6 个诊断弹窗测试、2 个 SAP 状态计时测试、5 个进度语义测试、2 个签名器重建测试） |
 | 后端构建 | `backend` `npm run build` | 通过 |
 | 前端构建 | `frontend` `npm run build` | 通过；产物含 `worker-*.js` 37 KB 与 `unicorn_x86-*.js` 1.03 MB，即签名器确实进了 bundle |
 | 服务真跑起来 | `node dist/index.js` | `/api/settings` 200、`/api/sap/assets` 200、`/api/sap/assets/CoreFP` 503 带提示、`/` 200、`POST /api/sap/assets/fetch` 202 |
 | 连不上 Apple 时的报错 | 同上（本沙箱正好连不上 `swcdn.apple.com`） | 实测返回：`cannot reach swcdn.apple.com ...: Client network socket disconnected before secure TLS connection was established.` + `SAP_ASSETS_DIR` 提示 |
 | 自带资产路径 | 手写 4 个 stand-in + `sap-assets.json`，`SAP_ASSETS_DIR` 指向它 | `ready: true`，`GET /api/sap/assets/CommerceKit` 200 带 `Cache-Control: immutable` |
 | WebSocket 中继 | 对跑起来的服务发升级请求 | **101 Switching Protocols**（`/wisp/` 可用，登录请求要走它） |
-| 补丁可复现 | 全新克隆 + `git am` **十个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
+| 补丁可复现 | 全新克隆 + `git am` **十一个**补丁 | 干净应用，`diff -r` 树与 `web/` 一致 |
 | 单行记录真抓得住错 | 把时间线改回逐条打印 | 1 个失败：`expected [ …(7) ] to have a length of 4 but got 7` |
 | store 折叠真抓得住错 | 把 `recordEvent` 改回无条件追加 | 3 个失败，其中 `expected [ …(3) ] to have a length of 2 but got 3` |
 | 时间线真抓得住错 | 把配对逻辑写成「找另一条同名结束条目」 | 2 个失败：`machine.open` 明明结束了却报 `STILL RUNNING` |
