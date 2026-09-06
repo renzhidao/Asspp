@@ -131,6 +131,7 @@ export async function getDownloadInfo(
       const keys = Object.keys(dict).filter((key) => key !== "dialog");
       const evidence = [
         customerMessage,
+        dict.failureType ? `code=${dict.failureType}` : "",
         `store=${account.store}`,
         `keys=${keys.join(",") || "none"}`,
       ]

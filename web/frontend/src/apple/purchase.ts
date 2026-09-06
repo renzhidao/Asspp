@@ -139,10 +139,17 @@ async function purchaseWithParams(
           msg = i18n.t("errors.purchase.unknownError");
         }
 
-        throw new PurchaseError(
-          msg ?? i18n.t("errors.purchase.failed", { failureType }),
-          failureType,
-        );
+        if (!msg) {
+          throw new PurchaseError(
+            i18n.t("errors.purchase.failed", { failureType }),
+            failureType,
+          );
+        }
+        // Apple's words alone are not enough: "App Not Available" is what came
+        // back for an app that is live and free in the account's storefront, so
+        // the words do not say which rule refused it. The numeric code does,
+        // and it was being thrown away whenever a message was present.
+        throw new PurchaseError(`${msg} (${failureType})`, failureType);
       }
     }
   }

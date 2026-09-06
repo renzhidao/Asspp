@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十九个 commit：
+二十个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -509,6 +509,43 @@ storefront 不对是最常见的原因，而这在原文案里完全看不出来
 
 **番茄小说到底为什么不行，仍然未知** —— 要看 Apple 实际回什么，而旧版把它丢了。
 部署 `0019` 之后，那条错误会自己说出来。
+
+## 桌面上的完整 setup 时间线，以及 exchange.1 的实测
+
+部署 `83253701` 之后，第一份带完整时间线的报告：
+
+```
+machine.open       +0.0s    took  7.3s
+machine.initialize +7.3s    took 14.0s
+certificate.fetch  +21.3s   took  0.9s
+exchange.1         +22.2s   took 107.6s
+setup.post         +129.8s  took  0.7s
+exchange.2         +130.5s  took  4.4s
+```
+
+`exchange.1` 在桌面 Chrome 上 **107.6 秒跑完了**。上游量测桌面整套 setup 是 115 秒，
+而这里 exchange.1 单步就是 107.6 秒 —— 和上游一致。手机上同一步撞 180 秒时限失败。
+
+`0013` 的块缓存是否让它变快了，**仍然无法直接证明** —— 没有缓存前的桌面数字可以对比。
+能确定的是：桌面上这一步现在能完成。
+
+## 番茄小说：Apple 说 "App Not Available"，但应用是存在的
+
+```
+响应中没有项目 (App Not Available store=143465
+  keys=pings,metrics,failureType,customerMessage,m-allowed,cancel-purchase-batch)
+```
+
+`cancel-purchase-batch` 是购买接口的响应形状，所以这是 `buyProduct` 回的。
+
+而这个应用**在中国区是存在的**：id `1468454200`，免费，13+，支持 iPhone/iPad/iPod，
+图书榜第一（apps.apple.com/cn/app/id1468454200）。所以「App Not Available」不是
+「查不到这个应用」。
+
+响应里有 `failureType`，但 `purchase.ts` 在有 `customerMessage` 时只抛那句话，
+把数字码丢了 —— 而那句话说明不了是哪条规则拒绝的。`0020` 让两处都把数字码带上。
+
+**具体是哪条规则，仍然未知**，要等带数字码的那一次。
 
 ## 我验证到了什么（全部本次实跑）
 
