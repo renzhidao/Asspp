@@ -87,7 +87,21 @@ export function useDownloadAction() {
       // already on the account — so get it and carry on instead of making the
       // click the thing that has to happen first.
       if (!(error instanceof DownloadError) || error.code !== "9610") throw error;
-      const licensed = await purchaseApp(licenseAccount, app);
+
+      let licensed: Awaited<ReturnType<typeof purchaseApp>>;
+      try {
+        licensed = await purchaseApp(licenseAccount, app);
+      } catch (licenseError) {
+        // The licence is the reason there was nothing to download, so its
+        // failure is the answer. Letting it go left the user holding "no items
+        // in response" with the actual reason thrown away.
+        const reason = getErrorMessage(licenseError, "unknown");
+        throw new DownloadError(
+          `${getErrorMessage(error, "unknown")} — ${reason}`,
+          error.code,
+        );
+      }
+
       licenseAccount = { ...licenseAccount, cookies: licensed.updatedCookies };
       await updateAccount(licenseAccount);
       return getDownloadInfo(licenseAccount, app, versionId);

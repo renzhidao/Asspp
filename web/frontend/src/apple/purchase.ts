@@ -89,7 +89,16 @@ async function purchaseWithParams(
     const customerMessage = dict.customerMessage as string | undefined;
     switch (failureType) {
       case "2059":
-        throw new PurchaseError(i18n.t("errors.purchase.unavailable"), "2059");
+        // Apple says the item is not available and gives a reason in
+        // customerMessage. Throwing the generic string instead meant every
+        // unavailable app looked identical — wrong storefront, wrong pricing
+        // parameters, app pulled, all the same dead end.
+        throw new PurchaseError(
+          customerMessage
+            ? `${i18n.t("errors.purchase.unavailable")} (${customerMessage})`
+            : i18n.t("errors.purchase.unavailable"),
+          "2059",
+        );
       case "2034":
       case "2042":
         throw new PurchaseError(

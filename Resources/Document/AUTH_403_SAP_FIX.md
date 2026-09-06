@@ -11,7 +11,7 @@
 | `web/` | 打了 SAP 签名补丁的 **AssppWeb 完整源码**（上游 `3bc9515` + 6 个 commit，169 个文件，1.9 MB） |
 | `Resources/Document/patches/` | 同样 14 个 commit 的 `git am` 补丁系列，给已经有 AssppWeb 检出的人 |
 
-十八个 commit：
+十九个 commit：
 
 ```
 0001 Fetch and serve the Apple binaries the SAP signer needs   ← 上游 PR #88
@@ -489,6 +489,26 @@ const renewed = await authenticate(
 `songList` 又是空的响应时，原来只抛「响应中没有项目」，把 Apple 的整段回答丢掉。
 现在带上 `customerMessage`、`store`（storefront）和响应里有哪些键——
 storefront 不对是最常见的原因，而这在原文案里完全看不出来。
+
+## 有些应用一直下载不了，和番茄小说一样
+
+用户说得很清楚：番茄小说在这个项目里**从来就下载不了**，SAP 之前也一样，
+而别的应用可以。所以这不是回归，是一直存在、只影响一部分应用的问题。
+
+三处把原因丢掉了：
+
+1. `purchase.ts` 的 `2059`（此项目不可用）把 Apple 的 `customerMessage` 扔掉，
+   只抛一句通用文案。storefront 不对、pricing parameters 不对、应用下架，
+   长得完全一样。`0019` 把它带上。
+2. 自动获取许可证失败时，那个失败被**吞掉**，用户只拿到下载那一步的
+   「响应中没有项目」。而许可证失败才是真正的原因。现在两条一起报。
+3. 上面那条 `noItems` 本身也没有证据（`0018` 已补）。
+
+`purchaseApp` 先试 `pricingParameters = "STDQ"`，遇 `2059` 再试 `"GAME"`
+（`purchase.ts:27`）。两次都不行才抛错，所以现在抛出来的那条带着 Apple 的原话。
+
+**番茄小说到底为什么不行，仍然未知** —— 要看 Apple 实际回什么，而旧版把它丢了。
+部署 `0019` 之后，那条错误会自己说出来。
 
 ## 我验证到了什么（全部本次实跑）
 

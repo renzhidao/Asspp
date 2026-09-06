@@ -162,6 +162,28 @@ describe("recording what was tried", () => {
     useActivityStore.setState({ entries: [] });
   });
 
+  it("surfaces Apple's reason, not a generic string", async () => {
+    // This is the app the user actually wants. The automatic licence attempt
+    // fails, and what reaches them has to say why Apple refused.
+    getDownloadInfo.mockRejectedValue(
+      new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "9610"),
+    );
+    purchaseApp.mockRejectedValue(
+      new PurchaseError("此项目不可用 (The item could not be found)", "2059"),
+    );
+
+    const { result } = renderHook(() => useDownloadAction());
+    await expect(result.current.startDownload(account, app)).rejects.toThrow();
+
+    const entries = useActivityStore.getState().entries;
+    expect(entries).toHaveLength(1);
+    expect(entries[0].ok).toBe(false);
+    expect(entries[0].detail).toContain("The item could not be found");
+    // Both reasons, not one: the download symptom and the licence failure that
+    // caused it. Before, only the symptom survived.
+    expect(entries[0].detail).toContain("响应中没有项目");
+  });
+
   it("records a download that failed and why", async () => {
     getDownloadInfo.mockRejectedValue(new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "x"));
 
