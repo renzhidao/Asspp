@@ -41,6 +41,15 @@ let settleSetup: { resolve: () => void; reject: (error: Error) => void } | null 
 function handle(event: MessageEvent<WorkerResponse>) {
   const message = event.data;
 
+  if (message.type === "step") {
+    store().recordEvent({
+      label: message.label,
+      at: message.at,
+      endedAt: message.endedAt,
+    });
+    return;
+  }
+
   if (message.type === "progress") {
     if (message.phase === "assets") {
       const { loaded, total } = message.asset;

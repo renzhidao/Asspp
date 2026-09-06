@@ -26,7 +26,19 @@ export interface SapConfig {
   /** Bag key sign-sap-version; only 200 is implemented. */
   version: number;
   hardwareID: Uint8Array;
+  onStep?: SetupStep;
 }
+
+/**
+ * One step of setup beginning or ending, with the wall-clock instant of each.
+ *
+ * Setup is a sequence of steps whose costs differ by orders of magnitude — two
+ * short network round trips around three runs of emulated guest code — and it
+ * is the one part of sign-in that can take minutes. Without knowing which step
+ * is running there is no way to tell "still working" from "wedged", and no way
+ * to say which of the two it was afterwards.
+ */
+export type SetupStep = (label: string, at: number, endedAt?: number) => void;
 
 /**
  * How the setup exchange reaches Apple. The browser has to tunnel it, and
@@ -109,7 +121,11 @@ export class Signer {
   private readonly hardwareID: Uint8Array;
   private closed = false;
 
-  private constructor(machine: Machine, context: bigint, hardwareID: Uint8Array) {
+  private constructor(
+    machine: Machine,
+    context: bigint,
+    hardwareID: Uint8Array,
+  ) {
     this.machine = machine;
     this.context = context;
     this.hardwareID = hardwareID;
@@ -120,29 +136,44 @@ export class Signer {
     config: SapConfig,
     transport: Transport,
   ): Promise<Signer> {
+    const step = config.onStep ?? (() => {});
+
     validate(config);
 
+    const openedAt = Date.now();
+    step("machine.open", openedAt);
     const machine = await Machine.open(bundle);
+    step("machine.open", openedAt, Date.now());
     let complete = false;
 
     try {
+      const initializedAt = Date.now();
+      step("machine.initialize", initializedAt);
       const context = machine.initialize(config.hardwareID);
+      step("machine.initialize", initializedAt, Date.now());
 
+      const certAt = Date.now();
+      step("certificate.fetch", certAt);
+      const certificateDocument = await transport({
+        method: "GET",
+        url: config.certificateURL,
+        headers: { "User-Agent": USER_AGENT },
+      });
+      step("certificate.fetch", certAt, Date.now());
       const certificate = plistBytes(
-        await transport({
-          method: "GET",
-          url: config.certificateURL,
-          headers: { "User-Agent": USER_AGENT },
-        }),
+        certificateDocument,
         SETUP_CERTIFICATE_KEY,
       );
 
+      const firstAt = Date.now();
+      step("exchange.1", firstAt);
       const first = machine.exchange(
         config.version,
         config.hardwareID,
         context,
         certificate,
       );
+      step("exchange.1", firstAt, Date.now());
       if (first.state !== 1) {
         throw new Error(`SAP setup entered unexpected state ${first.state}`);
       }
@@ -150,29 +181,35 @@ export class Signer {
         throw new Error("SAP setup message is empty");
       }
 
-      const reply = plistBytes(
-        await transport({
-          method: "POST",
-          url: config.setupURL,
-          headers: {
-            "Content-Type": "application/x-plist",
-            "User-Agent": USER_AGENT,
-          },
-          body: new TextEncoder().encode(
-            buildPlist({ [SETUP_BUFFER_KEY]: first.output }),
-          ),
-        }),
-        SETUP_BUFFER_KEY,
-      );
+      const postAt = Date.now();
+      step("setup.post", postAt);
+      const replyDocument = await transport({
+        method: "POST",
+        url: config.setupURL,
+        headers: {
+          "Content-Type": "application/x-plist",
+          "User-Agent": USER_AGENT,
+        },
+        body: new TextEncoder().encode(
+          buildPlist({ [SETUP_BUFFER_KEY]: first.output }),
+        ),
+      });
+      step("setup.post", postAt, Date.now());
+      const reply = plistBytes(replyDocument, SETUP_BUFFER_KEY);
 
+      const secondAt = Date.now();
+      step("exchange.2", secondAt);
       const second = machine.exchange(
         config.version,
         config.hardwareID,
         context,
         reply,
       );
+      step("exchange.2", secondAt, Date.now());
       if (second.state !== 0) {
-        throw new Error(`SAP setup completed in unexpected state ${second.state}`);
+        throw new Error(
+          `SAP setup completed in unexpected state ${second.state}`,
+        );
       }
 
       complete = true;

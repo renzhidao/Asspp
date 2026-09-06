@@ -35,7 +35,31 @@ export interface SapAssetsStatus {
   error?: string | null;
 }
 
+/** One setup step, as recorded by the store. See store/sap.ts. */
+export interface SapEvent {
+  label: string;
+  at: number;
+  endedAt?: number;
+}
+
+/**
+ * The parts of the device that decide how long the emulation takes.
+ *
+ * Setup is emulated x86-64 code, so its cost tracks the hardware it runs on
+ * far more than it tracks anything in the deployment — and every published
+ * timing for it is a desktop. A report from a phone without these cannot be
+ * compared to anything.
+ */
+export interface DeviceEnvironment {
+  cpuCores?: number | null;
+  deviceMemoryGB?: number | null;
+  platform?: string | null;
+  /** Whether the page has been backgrounded, which can suspend a worker. */
+  visibilityState?: string | null;
+}
+
 export interface DiagnosticsInput {
+  environment?: DeviceEnvironment | null;
   server?: ServerSettings | null;
   /** Why the server could not be read, if it could not be. */
   serverError?: string | null;
@@ -53,6 +77,8 @@ export interface DiagnosticsInput {
      * into a wait that has no other observable the reader is.
      */
     setupSeconds: number | null;
+    /** Every setup step seen this session, oldest first. */
+    events: SapEvent[];
     error: string | null;
     /** Masked before it gets here; see maskHardwareID. */
     hardwareID: string | null;
@@ -76,6 +102,42 @@ export function maskEmail(email: string): string {
 export function maskHardwareID(id: string | null): string | null {
   if (!id) return null;
   return id.length <= 4 ? "***" : `${id.slice(0, 4)}…`;
+}
+
+/**
+ * The step setup is in right now, or null if every recorded step has ended.
+ *
+ * The list is chronological and a step's end arrives as a second entry for the
+ * same label, so the last entry that has no `endedAt` is the one still running.
+ * That single value is what turns "stage: setup" — which says only that
+ * something is happening — into an answer.
+ */
+export function runningStep(events: SapEvent[]): SapEvent | null {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event.endedAt === undefined) return event;
+  }
+  return null;
+}
+
+/**
+ * Formats the recorded steps as a timeline relative to the first one, so the
+ * gaps between steps are visible as well as the steps.
+ *
+ * A step that never ended has no `endedAt`, and is the answer to "where did it
+ * stop?" — so it is marked rather than silently omitted.
+ */
+function setupTimeline(events: SapEvent[]): string[] {
+  if (events.length === 0) return ["  none recorded"];
+
+  const startedAt = events[0].at;
+  const at = (timestamp: number) => `+${((timestamp - startedAt) / 1000).toFixed(1)}s`;
+
+  return events.map((event) =>
+    event.endedAt !== undefined
+      ? `  ${event.label}  ${at(event.at)}  took ${((event.endedAt - event.at) / 1000).toFixed(1)}s`
+      : `  ${event.label}  ${at(event.at)}  STILL RUNNING`,
+  );
 }
 
 function line(label: string, value: unknown): string {
@@ -111,6 +173,17 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
       typeof Worker === "undefined" ? "unavailable" : "available",
     ),
   );
+  out.push("");
+
+  out.push("[device]");
+  if (input.environment) {
+    out.push(line("  cpuCores", input.environment.cpuCores));
+    out.push(line("  deviceMemoryGB", input.environment.deviceMemoryGB));
+    out.push(line("  platform", input.environment.platform));
+    out.push(line("  visibilityState", input.environment.visibilityState));
+  } else {
+    out.push("  unavailable");
+  }
   out.push("");
 
   out.push("[server]");
@@ -165,6 +238,19 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
     ),
   );
   out.push(line("  hardwareID", input.signer.hardwareID));
+
+  // The one line the whole section exists for: not "setup is happening" but
+  // which of setup's steps it is in, and for how long.
+  const running = runningStep(input.signer.events);
+  if (running) {
+    const forSeconds = (Date.now() - running.at) / 1000;
+    out.push(
+      `  stuckInStep: ${running.label} for ${forSeconds.toFixed(0)}s`,
+    );
+  }
+
+  out.push("  setupTimeline:");
+  for (const entry of setupTimeline(input.signer.events)) out.push(entry);
   if (input.signer.error) {
     out.push("  error:");
     for (const part of String(input.signer.error).split("\n")) {

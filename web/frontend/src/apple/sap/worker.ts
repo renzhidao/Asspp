@@ -17,6 +17,7 @@ export type WorkerResponse =
   | { type: "progress"; phase: "assets"; asset: AssetProgress }
   | { type: "progress"; phase: "installing"; found: number; total: number }
   | { type: "progress"; phase: "setup" }
+  | { type: "step"; label: string; at: number; endedAt?: number }
   | { type: "ready" }
   | { type: "signed"; id: number; signature: Uint8Array }
   | { type: "error"; id?: number; message: string };
@@ -74,6 +75,9 @@ async function setup(hardwareID: Uint8Array) {
       certificateURL: new URL("/api/sap/certificate", scope.location.origin).toString(),
       version: 200,
       hardwareID,
+      onStep: (label, at, endedAt) => {
+        post({ type: "step", label, at, endedAt });
+      },
     },
     transport,
   );

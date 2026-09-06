@@ -32,7 +32,8 @@ export default function DiagnosticsModal({
 }) {
   const { t, i18n } = useTranslation();
   const accounts = useAccountsStore((state) => state.accounts);
-  const { stage, percent, error, hardwareID, setupStartedAt } = useSapStore();
+  const { stage, percent, error, hardwareID, setupStartedAt, events } =
+    useSapStore();
   const addToast = useToastStore((state) => state.addToast);
 
   const [report, setReport] = useState<string | null>(null);
@@ -65,6 +66,22 @@ export default function DiagnosticsModal({
 
       setReport(
         buildDiagnostics({
+          // What the emulation is running on matters more than anything in the
+          // deployment: setup is emulated x86-64, and every published timing
+          // for it is a desktop. Without these a phone's report cannot be
+          // compared to anything.
+          environment: {
+            cpuCores: navigator.hardwareConcurrency ?? null,
+            deviceMemoryGB:
+              (navigator as Navigator & { deviceMemory?: number }).deviceMemory ??
+              null,
+            platform:
+              (navigator as Navigator & { userAgentData?: { platform?: string } })
+                .userAgentData?.platform ?? null,
+            // A backgrounded tab can have its worker suspended, which looks
+            // exactly like a hung setup.
+            visibilityState: document.visibilityState,
+          },
           server,
           serverError,
           sapAssets,
@@ -76,6 +93,7 @@ export default function DiagnosticsModal({
               setupStartedAt === null
                 ? null
                 : Math.round((Date.now() - setupStartedAt) / 1000),
+            events,
             error,
             hardwareID: maskHardwareID(hardwareID),
           },

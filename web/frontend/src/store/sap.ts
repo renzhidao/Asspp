@@ -8,6 +8,22 @@ import { create } from "zustand";
 // way shows the progress already being made instead of starting over in
 // silence.
 
+/**
+ * One setup step beginning or ending.
+ *
+ * Kept as a flat list rather than folded into a per-step object so that a step
+ * which never ends is visible as an entry with no matching end — that entry is
+ * the answer to "where did it stop?".
+ */
+export interface SapEvent {
+  /** Which step, e.g. `machine.initialize`. */
+  label: string;
+  /** Epoch milliseconds. */
+  at: number;
+  /** Present once the step finished; absent while it is still running. */
+  endedAt?: number;
+}
+
 export type SapStage =
   | "idle"
   /** The server is still fetching the binaries from Apple. */
@@ -30,6 +46,14 @@ interface SapStore {
    * makes a wait already nine minutes old look like one that just began.
    */
   setupStartedAt: number | null;
+  /**
+   * Every setup step seen this session, oldest first.
+   *
+   * Setup is minutes long and reports no progress, so after the fact the only
+   * evidence of what happened is this list. Bounded, because a session can
+   * retry several times and a report has to stay pasteable.
+   */
+  events: SapEvent[];
   error: string | null;
   /** The hardware id the signer was prepared for. */
   hardwareID: string | null;
@@ -40,12 +64,17 @@ interface SapStore {
   setSetup: () => void;
   setReady: () => void;
   setError: (message: string) => void;
+  recordEvent: (event: SapEvent) => void;
 }
+
+/** Enough for several full attempts, and still a short report. */
+const MAX_EVENTS = 80;
 
 export const useSapStore = create<SapStore>((set) => ({
   stage: "idle",
   percent: null,
   setupStartedAt: null,
+  events: [],
   error: null,
   hardwareID: null,
 
@@ -71,6 +100,10 @@ export const useSapStore = create<SapStore>((set) => ({
     set({ stage: "ready", percent: null, setupStartedAt: null, error: null }),
   setError: (message) =>
     set({ stage: "error", percent: null, setupStartedAt: null, error: message }),
+  recordEvent: (event) =>
+    set((state) => ({
+      events: [...state.events, event].slice(-MAX_EVENTS),
+    })),
 }));
 
 /** A human-readable line for the current stage, or null when there is nothing to say. */
