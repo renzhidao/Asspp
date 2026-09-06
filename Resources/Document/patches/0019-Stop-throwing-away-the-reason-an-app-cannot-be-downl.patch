@@ -1,0 +1,115 @@
+From 743a87bbb27cebdc27b2d3ff275235137d697e24 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 15:59:09 +0000
+Subject: [PATCH] Stop throwing away the reason an app cannot be downloaded
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Some apps have never been downloadable here — 番茄小说 among them, before the
+SAP change as well as after, while others work. Three places were discarding
+the answer.
+
+purchaseApp's 2059 threw a generic "unavailable" and dropped Apple's own
+customerMessage, so a wrong storefront, a wrong pricing parameter and a pulled
+app all looked identical. It now carries the message.
+
+When the automatic licence attempt fails, that failure was swallowed and the
+user got the download step's "no items in response" — the symptom, not the
+cause. Both are reported now.
+
+The exact reason for this app is still unknown, because the old build threw it
+away. With this in, the error says so itself.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/purchase.ts                | 11 +++++++++-
+ frontend/src/hooks/useDownloadAction.ts       | 16 +++++++++++++-
+ .../tests/hooks/useDownloadAction.test.tsx    | 22 +++++++++++++++++++
+ 3 files changed, 47 insertions(+), 2 deletions(-)
+
+diff --git a/frontend/src/apple/purchase.ts b/frontend/src/apple/purchase.ts
+index 43bed8b..71e33a8 100644
+--- a/frontend/src/apple/purchase.ts
++++ b/frontend/src/apple/purchase.ts
+@@ -89,7 +89,16 @@ async function purchaseWithParams(
+     const customerMessage = dict.customerMessage as string | undefined;
+     switch (failureType) {
+       case "2059":
+-        throw new PurchaseError(i18n.t("errors.purchase.unavailable"), "2059");
++        // Apple says the item is not available and gives a reason in
++        // customerMessage. Throwing the generic string instead meant every
++        // unavailable app looked identical — wrong storefront, wrong pricing
++        // parameters, app pulled, all the same dead end.
++        throw new PurchaseError(
++          customerMessage
++            ? `${i18n.t("errors.purchase.unavailable")} (${customerMessage})`
++            : i18n.t("errors.purchase.unavailable"),
++          "2059",
++        );
+       case "2034":
+       case "2042":
+         throw new PurchaseError(
+diff --git a/frontend/src/hooks/useDownloadAction.ts b/frontend/src/hooks/useDownloadAction.ts
+index 3682471..e083d3f 100644
+--- a/frontend/src/hooks/useDownloadAction.ts
++++ b/frontend/src/hooks/useDownloadAction.ts
+@@ -87,7 +87,21 @@ export function useDownloadAction() {
+       // already on the account — so get it and carry on instead of making the
+       // click the thing that has to happen first.
+       if (!(error instanceof DownloadError) || error.code !== "9610") throw error;
+-      const licensed = await purchaseApp(licenseAccount, app);
++
++      let licensed: Awaited<ReturnType<typeof purchaseApp>>;
++      try {
++        licensed = await purchaseApp(licenseAccount, app);
++      } catch (licenseError) {
++        // The licence is the reason there was nothing to download, so its
++        // failure is the answer. Letting it go left the user holding "no items
++        // in response" with the actual reason thrown away.
++        const reason = getErrorMessage(licenseError, "unknown");
++        throw new DownloadError(
++          `${getErrorMessage(error, "unknown")} — ${reason}`,
++          error.code,
++        );
++      }
++
+       licenseAccount = { ...licenseAccount, cookies: licensed.updatedCookies };
+       await updateAccount(licenseAccount);
+       return getDownloadInfo(licenseAccount, app, versionId);
+diff --git a/frontend/tests/hooks/useDownloadAction.test.tsx b/frontend/tests/hooks/useDownloadAction.test.tsx
+index 24547c8..2334927 100644
+--- a/frontend/tests/hooks/useDownloadAction.test.tsx
++++ b/frontend/tests/hooks/useDownloadAction.test.tsx
+@@ -162,6 +162,28 @@ describe("recording what was tried", () => {
+     useActivityStore.setState({ entries: [] });
+   });
+ 
++  it("surfaces Apple's reason, not a generic string", async () => {
++    // This is the app the user actually wants. The automatic licence attempt
++    // fails, and what reaches them has to say why Apple refused.
++    getDownloadInfo.mockRejectedValue(
++      new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "9610"),
++    );
++    purchaseApp.mockRejectedValue(
++      new PurchaseError("此项目不可用 (The item could not be found)", "2059"),
++    );
++
++    const { result } = renderHook(() => useDownloadAction());
++    await expect(result.current.startDownload(account, app)).rejects.toThrow();
++
++    const entries = useActivityStore.getState().entries;
++    expect(entries).toHaveLength(1);
++    expect(entries[0].ok).toBe(false);
++    expect(entries[0].detail).toContain("The item could not be found");
++    // Both reasons, not one: the download symptom and the licence failure that
++    // caused it. Before, only the symptom survived.
++    expect(entries[0].detail).toContain("响应中没有项目");
++  });
++
+   it("records a download that failed and why", async () => {
+     getDownloadInfo.mockRejectedValue(new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "x"));
+ 
+-- 
+2.39.5
+
