@@ -68,12 +68,17 @@ const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
  */
 // How long one guest call may take before it is called a failure.
 //
-// A desktop finishes the entire setup in 115 seconds, so one call there is
-// well under two minutes. The phone in the field reports runs at 1.2x that.
-// Anything past three minutes for a single call is not a slow device, it is a
-// guest that is not making progress — and the caller's own 15 minute timeout
-// is far too blunt to say anything about why.
-const GUEST_CALL_DEADLINE_MS = 180_000;
+// Measured upstream: setup is 35 s in WebKit, 63 s in Node and 115 s in desktop
+// Chrome, and the slowest device seen in the field runs at about 1.2x that. So
+// a legitimate call is well inside a minute and a half even there.
+//
+// This was 180 s, which is not enough margin: a machine slower than any of
+// those, or one under memory pressure, could have a legitimate call cut short,
+// and cutting a working setup is worse than waiting for one that is not. Ten
+// minutes still lands well inside the caller's own 15 minute timeout, so a
+// genuine hang is reported with its statistics rather than as a bare timeout —
+// which is the whole reason this exists — without risking a slow machine.
+const GUEST_CALL_DEADLINE_MS = 600_000;
 
 export interface GuestRunStats {
   /** Wall-clock milliseconds since the call began. */

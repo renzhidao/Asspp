@@ -18,8 +18,19 @@ describe("deadlineExceeded", () => {
     expect(deadlineExceeded(T0, T0 + 120_000)).toBe(false);
   });
 
-  it("fires past three minutes", () => {
-    expect(deadlineExceeded(T0, T0 + 180_001)).toBe(true);
+  it("gives a slow machine room rather than cutting a working setup short", () => {
+    // Three minutes turned out to be too little margin: a machine slower than
+    // any of the measured ones would have had a legitimate call killed, and
+    // cutting a working setup is worse than waiting for a hung one.
+    expect(deadlineExceeded(T0, T0 + 300_000)).toBe(false);
+    expect(deadlineExceeded(T0, T0 + 599_000)).toBe(false);
+  });
+
+  it("still fires before the caller's own 15 minute timeout", () => {
+    // The point of the deadline is that a hang is reported with statistics
+    // instead of as a bare timeout, so it has to land inside 900s.
+    expect(deadlineExceeded(T0, T0 + 600_001)).toBe(true);
+    expect(600_000).toBeLessThan(15 * 60 * 1000);
   });
 
   it("accepts an explicit limit", () => {
