@@ -46,7 +46,7 @@ async function status(headers: Record<string, string>): Promise<AssetStatus> {
  */
 async function ensureInstalled(
   headers: Record<string, string>,
-  onProgress?: (progress: AssetProgress) => void,
+  onServerProgress?: (found: number, total: number) => void,
 ): Promise<void> {
   let state = await status(headers);
   if (state.ready) return;
@@ -73,13 +73,11 @@ async function ensureInstalled(
     if (state.ready) return;
     if (state.error) throw new Error(state.error);
 
-    // Report as an asset-shaped step so the caller has one progress channel.
-    const found = state.progress?.found.length ?? 0;
-    onProgress?.({
-      name: state.progress?.stage ?? "server",
-      loaded: found,
-      total: 4,
-    });
+    // A count of files, not a count of bytes. It used to be pushed through the
+    // asset channel as loaded=found/total=4, where the caller read it as a
+    // percentage — so the screen jumped to 100% as soon as the server had
+    // located all four files and had not yet downloaded any of them.
+    onServerProgress?.(state.progress?.found.length ?? 0, 4);
   }
 }
 
@@ -160,12 +158,51 @@ async function fetchAsset(
 export async function loadAssets(
   headers: Record<string, string> = {},
   onProgress?: (progress: AssetProgress) => void,
+  onServerProgress?: (found: number, total: number) => void,
 ): Promise<AssetBundle> {
-  await ensureInstalled(headers, onProgress);
+  await ensureInstalled(headers, onServerProgress);
+
+  const names = Object.values(FILES);
+
+  // The four download in parallel and differ in size by two orders of
+  // magnitude, so reporting each one's own progress would read as 100% the
+  // moment the 207 KB one landed, with the 29 MB one barely started. Size them
+  // up front and report one number: bytes in hand over bytes expected.
+  const sizes = await Promise.all(
+    names.map(async (name) => {
+      try {
+        const head = await fetch(`/api/sap/assets/${name}`, {
+          method: "HEAD",
+          headers,
+        });
+        return Number(head.headers.get("Content-Length") ?? 0);
+      } catch {
+        return 0;
+      }
+    }),
+  );
+
+  const expected = sizes.reduce((sum, size) => sum + size, 0);
+  const perFile = new Map<string, number>();
+  let loadedBytes = 0;
 
   const entries = await Promise.all(
     Object.entries(FILES).map(async ([key, name]) => {
-      return [key, await fetchAsset(name, headers, onProgress)] as const;
+      const bytes = await fetchAsset(name, headers, (step) => {
+        if (!onProgress) return;
+        perFile.set(step.name, step.loaded);
+        loadedBytes = [...perFile.values()].reduce((a, b) => a + b, 0);
+
+        // Without a usable total there is no honest number to give, and a
+        // made-up one is worse than none — that is what put 100% on screen
+        // during a download that had barely begun.
+        onProgress({
+          name: step.name,
+          loaded: expected > 0 ? loadedBytes : step.loaded,
+          total: expected > 0 ? expected : step.total,
+        });
+      });
+      return [key, bytes] as const;
     }),
   );
 

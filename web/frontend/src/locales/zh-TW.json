@@ -110,6 +110,7 @@
       "codePlaceholder": "000000",
       "codeHelp": "輸入來自您受信任裝置的驗證碼。",
       "signIn": "登入",
+      "installingAssets": "伺服器正在從 Apple 下載簽章元件（38 MB），首次部署需要幾分鐘…",
       "preparingAssets": "正在準備簽名元件 {{percent}}%",
       "preparingSigner": "正在初始化簽名器，約需一分鐘…",
       "signingRequest": "正在簽署請求…",

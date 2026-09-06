@@ -34,7 +34,9 @@ export default function SapStatus() {
     <span className="col-span-full flex items-center text-sm text-gray-600 dark:text-gray-400">
       {stage === "assets"
         ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
-        : t("accounts.addForm.preparingSigner")}
+        : stage === "installing"
+          ? t("accounts.addForm.installingAssets")
+          : t("accounts.addForm.preparingSigner")}
     </span>
   );
 }

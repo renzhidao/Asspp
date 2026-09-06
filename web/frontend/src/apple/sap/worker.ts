@@ -15,6 +15,7 @@ export type WorkerRequest =
 
 export type WorkerResponse =
   | { type: "progress"; phase: "assets"; asset: AssetProgress }
+  | { type: "progress"; phase: "installing"; found: number; total: number }
   | { type: "progress"; phase: "setup" }
   | { type: "ready" }
   | { type: "signed"; id: number; signature: Uint8Array }
@@ -52,9 +53,15 @@ function post(message: WorkerResponse, transfer?: Transferable[]) {
 }
 
 async function setup(hardwareID: Uint8Array) {
-  const bundle = await loadAssets(accessHeaders, (asset) => {
-    post({ type: "progress", phase: "assets", asset });
-  });
+  const bundle = await loadAssets(
+    accessHeaders,
+    (asset) => {
+      post({ type: "progress", phase: "assets", asset });
+    },
+    (found, total) => {
+      post({ type: "progress", phase: "installing", found, total });
+    },
+  );
 
   post({ type: "progress", phase: "setup" });
 

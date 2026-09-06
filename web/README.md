@@ -123,6 +123,27 @@ few million more. Setup starts in the background as soon as there is an account
 to bind a signer to, and the button reports progress meanwhile. On a phone,
 expect it to be slow and expect the memory to matter.
 
+### Which version is running
+
+Pass the commit and date at build time, or every deployment reports
+`buildCommit: unknown` and there is no way to tell two of them apart from a
+diagnostics report:
+
+```bash
+docker build \
+  --build-arg BUILD_COMMIT="$(git rev-parse --short HEAD)" \
+  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  -t assppweb:sap .
+```
+
+### `/tmp` is not storage
+
+The image defaults `DATA_DIR` to `/data`. A deployment that sets it to
+something under `/tmp` loses the 38 MB of SAP binaries on every restart and
+downloads them again, which on a slow uplink looks like a hang at sign-in. Put
+`DATA_DIR` on a volume — on a host with a persistent-storage option, that one;
+anywhere else, a mounted volume.
+
 ### When the host cannot reach Apple's CDN
 
 `swcdn.apple.com` is not reachable from everywhere. Rather than let sign-in

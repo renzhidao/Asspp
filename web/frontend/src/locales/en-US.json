@@ -110,6 +110,7 @@
       "codePlaceholder": "000000",
       "codeHelp": "Enter the verification code from your trusted device.",
       "signIn": "Sign In",
+      "installingAssets": "The server is downloading the signing components from Apple (38 MB); this takes a few minutes on a first deployment…",
       "preparingAssets": "Preparing signing components {{percent}}%",
       "preparingSigner": "Setting up the signer, this takes about a minute…",
       "signingRequest": "Signing the request…",

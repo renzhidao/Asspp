@@ -94,6 +94,20 @@ describe("DiagnosticsModal", () => {
     expect(report).toContain("stage: assets");
   });
 
+  it("distinguishes the server downloading the binaries from the phone downloading them", async () => {
+    vi.mocked(apiGet).mockImplementation(async (path: string) =>
+      path === "/api/settings" ? ({ buildCommit: "3bc9515" } as any) : ({ ready: true } as any),
+    );
+    // The stage a first-time visitor actually sits in: the server is still
+    // pulling 38 MB from Apple, so there is no honest percentage to show.
+    useSapStore.setState({ stage: "installing", percent: null, error: null, hardwareID: "a1b2" } as any);
+
+    const { default: SapStatus } = await import("../../src/components/common/SapStatus");
+    const { container } = render(<SapStatus />);
+
+    expect(container.textContent).toBe("accounts.addForm.installingAssets");
+  });
+
   it("copies the report to the clipboard on request", async () => {
     vi.mocked(apiGet).mockImplementation(async (path: string) =>
       path === "/api/settings" ? ({ buildCommit: "3bc9515" } as any) : ({ ready: true } as any),

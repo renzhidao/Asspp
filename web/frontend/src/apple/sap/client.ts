@@ -16,6 +16,8 @@ import type { WorkerRequest, WorkerResponse } from "./worker";
 
 export type SetupProgress =
   | { phase: "assets"; asset: AssetProgress }
+  /** The server is still fetching the binaries from Apple; nothing to show as a percentage yet. */
+  | { phase: "installing"; found: number; total: number }
   | { phase: "setup" }
   | { phase: "signing" };
 
@@ -44,6 +46,16 @@ function handle(event: MessageEvent<WorkerResponse>) {
       const { loaded, total } = message.asset;
       store().setAssets(total ? Math.round((loaded / total) * 100) : 0);
       onProgress?.({ phase: "assets", asset: message.asset });
+    } else if (message.phase === "installing") {
+      // The bytes are on their way from Apple to the server, not to us. No
+      // honest percentage exists for that, so it gets its own stage rather
+      // than borrowing the asset one and reading as further along than it is.
+      store().setInstalling();
+      onProgress?.({
+        phase: "installing",
+        found: message.found,
+        total: message.total,
+      });
     } else {
       store().setSetup();
       onProgress?.({ phase: "setup" });

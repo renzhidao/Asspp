@@ -8,7 +8,14 @@ import { create } from "zustand";
 // way shows the progress already being made instead of starting over in
 // silence.
 
-export type SapStage = "idle" | "assets" | "setup" | "ready" | "error";
+export type SapStage =
+  | "idle"
+  /** The server is still fetching the binaries from Apple. */
+  | "installing"
+  | "assets"
+  | "setup"
+  | "ready"
+  | "error";
 
 interface SapStore {
   stage: SapStage;
@@ -19,6 +26,7 @@ interface SapStore {
   hardwareID: string | null;
 
   begin: (hardwareID: string) => void;
+  setInstalling: () => void;
   setAssets: (percent: number) => void;
   setSetup: () => void;
   setReady: () => void;
@@ -33,6 +41,7 @@ export const useSapStore = create<SapStore>((set) => ({
 
   begin: (hardwareID) =>
     set({ stage: "assets", percent: 0, error: null, hardwareID }),
+  setInstalling: () => set({ stage: "installing", percent: null }),
   setAssets: (percent) => set({ stage: "assets", percent }),
   setSetup: () => set({ stage: "setup", percent: null }),
   setReady: () => set({ stage: "ready", percent: null, error: null }),
