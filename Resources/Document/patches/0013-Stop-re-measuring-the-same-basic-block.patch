@@ -1,0 +1,209 @@
+From 0db71cb4399e805a5a8fc4767794ed31efdf7e7a Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 13:56:37 +0000
+Subject: [PATCH] Stop re-measuring the same basic block
+
+The deadline from the previous commit fired as intended and reported:
+
+  SAP guest call exceeded 180s (elapsed 180.0s, 1003147 blocks,
+  0 undecodable, 0 unassisted instructions, budget left 84901039)
+
+That rules out both earlier hypotheses. The decoder never failed, so no block
+was unreadable. The unassisted path never ran, so the 2M cap addressed
+something that was not happening. And the budget had barely moved: fifteen
+million instructions across a million turns of the loop, about fifteen
+instructions a block.
+
+The cost is per block, not per instruction. Every turn reads a 32 x 15 byte
+window and decodes it to find where the block ends, and guest code loops, so
+the same blocks were being measured over and over.
+
+Block layouts are now cached for the length of one run. That is safe because
+segment() plants its HLT and restores the original byte inside the same call,
+so measure() always sees unmodified memory; between runs the guest may have
+written to itself, so each run starts from an empty cache. A full cache is
+emptied whole rather than evicted entry by entry, because a wrong hint would
+be worse than a miss.
+
+The stats gained a "cached blocks" count, so the next report shows the hit rate
+directly.
+
+Whether this is actually faster is not verified: this environment has no real
+38 MB binaries, so the emulation cannot be run here. BlockCache carries six
+unit tests; its wiring into run() does not. The worst case is a cache that
+never hits, which leaves the speed as it was and still reports through the
+deadline.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/sap/machine.ts       | 56 +++++++++++++++++++++++-
+ frontend/tests/apple/blockCache.test.ts | 58 +++++++++++++++++++++++++
+ 2 files changed, 113 insertions(+), 1 deletion(-)
+ create mode 100644 frontend/tests/apple/blockCache.test.ts
+
+diff --git a/frontend/src/apple/sap/machine.ts b/frontend/src/apple/sap/machine.ts
+index e5fcbf5..40bd355 100644
+--- a/frontend/src/apple/sap/machine.ts
++++ b/frontend/src/apple/sap/machine.ts
+@@ -82,6 +82,8 @@ export interface GuestRunStats {
+   steps: number;
+   /** Blocks the decoder could not read. */
+   measureFailures: number;
++  /** Blocks whose layout came from the cache rather than a fresh decode. */
++  measureHits: number;
+   /** Instructions handed to the emulator without splitting help. */
+   unassisted: number;
+   /** Remaining instruction budget. */
+@@ -108,11 +110,52 @@ export function describeGuestRun(stats: GuestRunStats): string {
+     `elapsed ${(stats.elapsedMs / 1000).toFixed(1)}s, ` +
+     `${stats.steps} blocks, ` +
+     `${stats.measureFailures} undecodable, ` +
++    `${stats.measureHits} cached blocks, ` +
+     `${stats.unassisted} unassisted instructions, ` +
+     `budget left ${stats.budget}`
+   );
+ }
+ 
++/**
++ * Remembers how a block at an address measured, for the length of one run.
++ *
++ * The error that identified the cost read `1003147 blocks` against a budget
++ * that had barely moved — a million turns of the loop for fifteen million
++ * instructions, about fifteen instructions a block, each paying a fresh
++ * 480-byte read and decode. Guest code loops, so the same blocks come back
++ * around and were being measured over and over.
++ *
++ * Valid for one run only, and safe because segment() plants its HLT and puts
++ * the original byte back inside the same call, so measure() always sees
++ * unmodified memory. Between runs the guest may have written to itself, so
++ * run() starts from an empty cache.
++ */
++export class BlockCache {
++  private readonly entries = new Map<string, Block | null>();
++
++  constructor(private readonly limit: number = 1 << 16) {}
++
++  get(address: bigint): Block | null | undefined {
++    const hit = this.entries.get(address.toString(16));
++    return hit === undefined ? undefined : hit;
++  }
++
++  /** A full cache is emptied rather than evicted one at a time: it is a hint,
++   * and a wrong hint would be worse than a miss. */
++  set(address: bigint, block: Block | null): void {
++    if (this.entries.size >= this.limit) this.entries.clear();
++    this.entries.set(address.toString(16), block);
++  }
++
++  clear(): void {
++    this.entries.clear();
++  }
++
++  get size(): number {
++    return this.entries.size;
++  }
++}
++
+ export function unassistedAllowance(
+   remaining: number,
+   alreadyRun: number,
+@@ -446,6 +489,8 @@ export class Machine {
+     const startedAt = Date.now();
+     let steps = 0;
+     let measureFailures = 0;
++    let measureHits = 0;
++    const cache = new BlockCache();
+ 
+     while (budget > 0) {
+       // Checked once per block rather than per instruction: the block loop is
+@@ -459,13 +504,22 @@ export class Machine {
+               elapsedMs: Date.now() - startedAt,
+               steps,
+               measureFailures,
++              measureHits,
+               unassisted: this.unassisted,
+               budget,
+             })})`,
+         );
+       }
+ 
+-      const block = this.measure(address);
++      const cached = cache.get(address);
++      let block: Block | null;
++      if (cached === undefined) {
++        block = this.measure(address);
++        cache.set(address, block);
++      } else {
++        block = cached;
++        measureHits++;
++      }
+ 
+       if (!block) {
+         measureFailures++;
+diff --git a/frontend/tests/apple/blockCache.test.ts b/frontend/tests/apple/blockCache.test.ts
+new file mode 100644
+index 0000000..1e2219e
+--- /dev/null
++++ b/frontend/tests/apple/blockCache.test.ts
+@@ -0,0 +1,58 @@
++import { describe, it, expect } from "vitest";
++import { BlockCache } from "../../src/apple/sap/machine";
++import type { Block } from "../../src/apple/sap/length";
++
++// The error that found the cost read 1,003,147 blocks against a budget that
++// had barely moved: a million turns of the loop for fifteen million
++// instructions, each paying a fresh 480-byte read and decode. Guest code loops,
++// so the cache exists to stop measuring the same block over and over.
++
++const block = { instructions: 9, end: 24 } as unknown as Block;
++
++describe("BlockCache", () => {
++  it("returns undefined for an address it has never seen", () => {
++    const cache = new BlockCache();
++    expect(cache.get(0x1000n)).toBeUndefined();
++  });
++
++  it("gives back what was measured at an address", () => {
++    const cache = new BlockCache();
++    cache.set(0x1000n, block);
++    expect(cache.get(0x1000n)).toBe(block);
++  });
++
++  it("distinguishes a measured null from a miss", () => {
++    // A block the decoder could not read is cached as null, and has to come
++    // back as null — not as undefined, which would mean "decode it again".
++    const cache = new BlockCache();
++    cache.set(0x2000n, null);
++    expect(cache.get(0x2000n)).toBeNull();
++    expect(cache.get(0x2000n)).not.toBeUndefined();
++  });
++
++  it("keeps distinct addresses apart", () => {
++    const cache = new BlockCache();
++    cache.set(0x1000n, block);
++    expect(cache.get(0x1001n)).toBeUndefined();
++  });
++
++  it("empties rather than grows without bound", () => {
++    const cache = new BlockCache(4);
++    for (let index = 0; index < 4; index++) cache.set(BigInt(0x1000 + index), block);
++    expect(cache.size).toBe(4);
++
++    cache.set(0x9999n, block);
++    // A wrong hint would be worse than a miss, so a full cache is dropped
++    // whole instead of evicting entries one at a time.
++    expect(cache.size).toBe(1);
++    expect(cache.get(0x1000n)).toBeUndefined();
++  });
++
++  it("clears, so a new run starts from nothing", () => {
++    const cache = new BlockCache();
++    cache.set(0x1000n, block);
++    cache.clear();
++    expect(cache.size).toBe(0);
++    expect(cache.get(0x1000n)).toBeUndefined();
++  });
++});
+-- 
+2.39.5
+

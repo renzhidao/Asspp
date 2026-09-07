@@ -1,0 +1,581 @@
+From df0b7b0b420c0f15ccb0a1e870cce23b26cc7ad1 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 10:45:22 +0000
+Subject: [PATCH] Report SAP asset progress honestly
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A real diagnostic report came back reading stage: assets, percent: 100 with no
+error, which looks like a stall at 100% and is not one. The four binaries
+download in parallel and differ in size by two orders of magnitude, and each
+reported its own loaded/total, so the screen said 100% the moment the 207 KB
+one landed — with the 29 MB one barely started and most of the wait still ahead.
+
+Progress is now one number: bytes in hand over bytes expected, sized up front
+with a HEAD per file. When the total cannot be known it falls back to per-file
+numbers rather than computing a percentage against a wrong denominator.
+
+The server's own fetch from Apple was also being pushed through that channel as
+loaded=found/total=4, where it read as a byte percentage — so it showed 100%
+before a single byte had been downloaded. It gets its own installing stage with
+no percentage, since there is no honest one to give.
+
+Verified by reverting the accumulation and watching the new tests fail with
+'expected 100 to be less than 50'.
+
+Also documents that DATA_DIR must not live under /tmp — a deployment that does
+loses the 38 MB on every restart and re-downloads it, which on a slow uplink
+looks exactly like a hang at sign-in — and that BUILD_COMMIT needs passing at
+build time, without which every deployment reports 'unknown'.
+---
+ README.md                                     |  21 ++
+ frontend/src/apple/sap/assets.ts              |  57 ++++-
+ frontend/src/apple/sap/client.ts              |  12 ++
+ frontend/src/apple/sap/worker.ts              |  13 +-
+ frontend/src/components/common/SapStatus.tsx  |   4 +-
+ frontend/src/locales/en-US.json               |   1 +
+ frontend/src/locales/ja.json                  |   1 +
+ frontend/src/locales/ko.json                  |   1 +
+ frontend/src/locales/ru.json                  |   1 +
+ frontend/src/locales/zh-CN.json               |   1 +
+ frontend/src/locales/zh-TW.json               |   1 +
+ frontend/src/store/sap.ts                     |  11 +-
+ frontend/tests/apple/sapAssets.test.ts        | 197 ++++++++++++++++++
+ .../components/DiagnosticsModal.test.tsx      |  14 ++
+ 14 files changed, 320 insertions(+), 15 deletions(-)
+ create mode 100644 frontend/tests/apple/sapAssets.test.ts
+
+diff --git a/README.md b/README.md
+index c2ef109..b02f94e 100644
+--- a/README.md
++++ b/README.md
+@@ -123,6 +123,27 @@ few million more. Setup starts in the background as soon as there is an account
+ to bind a signer to, and the button reports progress meanwhile. On a phone,
+ expect it to be slow and expect the memory to matter.
+ 
++### Which version is running
++
++Pass the commit and date at build time, or every deployment reports
++`buildCommit: unknown` and there is no way to tell two of them apart from a
++diagnostics report:
++
++```bash
++docker build \
++  --build-arg BUILD_COMMIT="$(git rev-parse --short HEAD)" \
++  --build-arg BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
++  -t assppweb:sap .
++```
++
++### `/tmp` is not storage
++
++The image defaults `DATA_DIR` to `/data`. A deployment that sets it to
++something under `/tmp` loses the 38 MB of SAP binaries on every restart and
++downloads them again, which on a slow uplink looks like a hang at sign-in. Put
++`DATA_DIR` on a volume — on a host with a persistent-storage option, that one;
++anywhere else, a mounted volume.
++
+ ### When the host cannot reach Apple's CDN
+ 
+ `swcdn.apple.com` is not reachable from everywhere. Rather than let sign-in
+diff --git a/frontend/src/apple/sap/assets.ts b/frontend/src/apple/sap/assets.ts
+index 2a0cb0f..6942d90 100644
+--- a/frontend/src/apple/sap/assets.ts
++++ b/frontend/src/apple/sap/assets.ts
+@@ -46,7 +46,7 @@ async function status(headers: Record<string, string>): Promise<AssetStatus> {
+  */
+ async function ensureInstalled(
+   headers: Record<string, string>,
+-  onProgress?: (progress: AssetProgress) => void,
++  onServerProgress?: (found: number, total: number) => void,
+ ): Promise<void> {
+   let state = await status(headers);
+   if (state.ready) return;
+@@ -73,13 +73,11 @@ async function ensureInstalled(
+     if (state.ready) return;
+     if (state.error) throw new Error(state.error);
+ 
+-    // Report as an asset-shaped step so the caller has one progress channel.
+-    const found = state.progress?.found.length ?? 0;
+-    onProgress?.({
+-      name: state.progress?.stage ?? "server",
+-      loaded: found,
+-      total: 4,
+-    });
++    // A count of files, not a count of bytes. It used to be pushed through the
++    // asset channel as loaded=found/total=4, where the caller read it as a
++    // percentage — so the screen jumped to 100% as soon as the server had
++    // located all four files and had not yet downloaded any of them.
++    onServerProgress?.(state.progress?.found.length ?? 0, 4);
+   }
+ }
+ 
+@@ -160,12 +158,51 @@ async function fetchAsset(
+ export async function loadAssets(
+   headers: Record<string, string> = {},
+   onProgress?: (progress: AssetProgress) => void,
++  onServerProgress?: (found: number, total: number) => void,
+ ): Promise<AssetBundle> {
+-  await ensureInstalled(headers, onProgress);
++  await ensureInstalled(headers, onServerProgress);
++
++  const names = Object.values(FILES);
++
++  // The four download in parallel and differ in size by two orders of
++  // magnitude, so reporting each one's own progress would read as 100% the
++  // moment the 207 KB one landed, with the 29 MB one barely started. Size them
++  // up front and report one number: bytes in hand over bytes expected.
++  const sizes = await Promise.all(
++    names.map(async (name) => {
++      try {
++        const head = await fetch(`/api/sap/assets/${name}`, {
++          method: "HEAD",
++          headers,
++        });
++        return Number(head.headers.get("Content-Length") ?? 0);
++      } catch {
++        return 0;
++      }
++    }),
++  );
++
++  const expected = sizes.reduce((sum, size) => sum + size, 0);
++  const perFile = new Map<string, number>();
++  let loadedBytes = 0;
+ 
+   const entries = await Promise.all(
+     Object.entries(FILES).map(async ([key, name]) => {
+-      return [key, await fetchAsset(name, headers, onProgress)] as const;
++      const bytes = await fetchAsset(name, headers, (step) => {
++        if (!onProgress) return;
++        perFile.set(step.name, step.loaded);
++        loadedBytes = [...perFile.values()].reduce((a, b) => a + b, 0);
++
++        // Without a usable total there is no honest number to give, and a
++        // made-up one is worse than none — that is what put 100% on screen
++        // during a download that had barely begun.
++        onProgress({
++          name: step.name,
++          loaded: expected > 0 ? loadedBytes : step.loaded,
++          total: expected > 0 ? expected : step.total,
++        });
++      });
++      return [key, bytes] as const;
+     }),
+   );
+ 
+diff --git a/frontend/src/apple/sap/client.ts b/frontend/src/apple/sap/client.ts
+index f2f5ac4..f75d346 100644
+--- a/frontend/src/apple/sap/client.ts
++++ b/frontend/src/apple/sap/client.ts
+@@ -16,6 +16,8 @@ import type { WorkerRequest, WorkerResponse } from "./worker";
+ 
+ export type SetupProgress =
+   | { phase: "assets"; asset: AssetProgress }
++  /** The server is still fetching the binaries from Apple; nothing to show as a percentage yet. */
++  | { phase: "installing"; found: number; total: number }
+   | { phase: "setup" }
+   | { phase: "signing" };
+ 
+@@ -44,6 +46,16 @@ function handle(event: MessageEvent<WorkerResponse>) {
+       const { loaded, total } = message.asset;
+       store().setAssets(total ? Math.round((loaded / total) * 100) : 0);
+       onProgress?.({ phase: "assets", asset: message.asset });
++    } else if (message.phase === "installing") {
++      // The bytes are on their way from Apple to the server, not to us. No
++      // honest percentage exists for that, so it gets its own stage rather
++      // than borrowing the asset one and reading as further along than it is.
++      store().setInstalling();
++      onProgress?.({
++        phase: "installing",
++        found: message.found,
++        total: message.total,
++      });
+     } else {
+       store().setSetup();
+       onProgress?.({ phase: "setup" });
+diff --git a/frontend/src/apple/sap/worker.ts b/frontend/src/apple/sap/worker.ts
+index 758ebec..7179cce 100644
+--- a/frontend/src/apple/sap/worker.ts
++++ b/frontend/src/apple/sap/worker.ts
+@@ -15,6 +15,7 @@ export type WorkerRequest =
+ 
+ export type WorkerResponse =
+   | { type: "progress"; phase: "assets"; asset: AssetProgress }
++  | { type: "progress"; phase: "installing"; found: number; total: number }
+   | { type: "progress"; phase: "setup" }
+   | { type: "ready" }
+   | { type: "signed"; id: number; signature: Uint8Array }
+@@ -52,9 +53,15 @@ function post(message: WorkerResponse, transfer?: Transferable[]) {
+ }
+ 
+ async function setup(hardwareID: Uint8Array) {
+-  const bundle = await loadAssets(accessHeaders, (asset) => {
+-    post({ type: "progress", phase: "assets", asset });
+-  });
++  const bundle = await loadAssets(
++    accessHeaders,
++    (asset) => {
++      post({ type: "progress", phase: "assets", asset });
++    },
++    (found, total) => {
++      post({ type: "progress", phase: "installing", found, total });
++    },
++  );
+ 
+   post({ type: "progress", phase: "setup" });
+ 
+diff --git a/frontend/src/components/common/SapStatus.tsx b/frontend/src/components/common/SapStatus.tsx
+index f4b6452..5618216 100644
+--- a/frontend/src/components/common/SapStatus.tsx
++++ b/frontend/src/components/common/SapStatus.tsx
+@@ -34,7 +34,9 @@ export default function SapStatus() {
+     <span className="col-span-full flex items-center text-sm text-gray-600 dark:text-gray-400">
+       {stage === "assets"
+         ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
+-        : t("accounts.addForm.preparingSigner")}
++        : stage === "installing"
++          ? t("accounts.addForm.installingAssets")
++          : t("accounts.addForm.preparingSigner")}
+     </span>
+   );
+ }
+diff --git a/frontend/src/locales/en-US.json b/frontend/src/locales/en-US.json
+index f977ab7..03f50f8 100644
+--- a/frontend/src/locales/en-US.json
++++ b/frontend/src/locales/en-US.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "Enter the verification code from your trusted device.",
+       "signIn": "Sign In",
++      "installingAssets": "The server is downloading the signing components from Apple (38 MB); this takes a few minutes on a first deployment…",
+       "preparingAssets": "Preparing signing components {{percent}}%",
+       "preparingSigner": "Setting up the signer, this takes about a minute…",
+       "signingRequest": "Signing the request…",
+diff --git a/frontend/src/locales/ja.json b/frontend/src/locales/ja.json
+index 33f2300..0d6a1b1 100644
+--- a/frontend/src/locales/ja.json
++++ b/frontend/src/locales/ja.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "信頼できるデバイスからの確認コードを入力してください。",
+       "signIn": "サインイン",
++      "installingAssets": "サーバーが Apple から署名コンポーネント（38 MB）をダウンロードしています。初回展開では数分かかります…",
+       "preparingAssets": "署名コンポーネントを準備中 {{percent}}%",
+       "preparingSigner": "署名機能を初期化しています。1分ほどかかります…",
+       "signingRequest": "リクエストに署名しています…",
+diff --git a/frontend/src/locales/ko.json b/frontend/src/locales/ko.json
+index 192bbc1..5bc6088 100644
+--- a/frontend/src/locales/ko.json
++++ b/frontend/src/locales/ko.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "신뢰할 수 있는 기기에서 확인 코드를 입력하세요.",
+       "signIn": "로그인",
++      "installingAssets": "서버가 Apple에서 서명 구성 요소(38 MB)를 내려받는 중입니다. 첫 배포에서는 몇 분 걸립니다…",
+       "preparingAssets": "서명 구성요소 준비 중 {{percent}}%",
+       "preparingSigner": "서명기를 초기화하는 중입니다. 1분 정도 걸립니다…",
+       "signingRequest": "요청에 서명하는 중…",
+diff --git a/frontend/src/locales/ru.json b/frontend/src/locales/ru.json
+index 266a18e..d2f72d4 100644
+--- a/frontend/src/locales/ru.json
++++ b/frontend/src/locales/ru.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "Введите код проверки с вашего доверенного устройства.",
+       "signIn": "Войти",
++      "installingAssets": "Сервер загружает компоненты подписи с Apple (38 МБ); при первом развёртывании это занимает несколько минут…",
+       "preparingAssets": "Подготовка компонентов подписи {{percent}}%",
+       "preparingSigner": "Инициализация подписи, это занимает около минуты…",
+       "signingRequest": "Подписывание запроса…",
+diff --git a/frontend/src/locales/zh-CN.json b/frontend/src/locales/zh-CN.json
+index 5bc8497..e767302 100644
+--- a/frontend/src/locales/zh-CN.json
++++ b/frontend/src/locales/zh-CN.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "输入来自您受信任设备的验证码。",
+       "signIn": "登录",
++      "installingAssets": "服务器正在从 Apple 下载签名组件（38 MB），首次部署需要几分钟…",
+       "preparingAssets": "正在准备签名组件 {{percent}}%",
+       "preparingSigner": "正在初始化签名器，约需一分钟…",
+       "signingRequest": "正在签名请求…",
+diff --git a/frontend/src/locales/zh-TW.json b/frontend/src/locales/zh-TW.json
+index 3d275c8..4511808 100644
+--- a/frontend/src/locales/zh-TW.json
++++ b/frontend/src/locales/zh-TW.json
+@@ -110,6 +110,7 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "輸入來自您受信任裝置的驗證碼。",
+       "signIn": "登入",
++      "installingAssets": "伺服器正在從 Apple 下載簽章元件（38 MB），首次部署需要幾分鐘…",
+       "preparingAssets": "正在準備簽名元件 {{percent}}%",
+       "preparingSigner": "正在初始化簽名器，約需一分鐘…",
+       "signingRequest": "正在簽署請求…",
+diff --git a/frontend/src/store/sap.ts b/frontend/src/store/sap.ts
+index bbc3384..bcc3752 100644
+--- a/frontend/src/store/sap.ts
++++ b/frontend/src/store/sap.ts
+@@ -8,7 +8,14 @@ import { create } from "zustand";
+ // way shows the progress already being made instead of starting over in
+ // silence.
+ 
+-export type SapStage = "idle" | "assets" | "setup" | "ready" | "error";
++export type SapStage =
++  | "idle"
++  /** The server is still fetching the binaries from Apple. */
++  | "installing"
++  | "assets"
++  | "setup"
++  | "ready"
++  | "error";
+ 
+ interface SapStore {
+   stage: SapStage;
+@@ -19,6 +26,7 @@ interface SapStore {
+   hardwareID: string | null;
+ 
+   begin: (hardwareID: string) => void;
++  setInstalling: () => void;
+   setAssets: (percent: number) => void;
+   setSetup: () => void;
+   setReady: () => void;
+@@ -33,6 +41,7 @@ export const useSapStore = create<SapStore>((set) => ({
+ 
+   begin: (hardwareID) =>
+     set({ stage: "assets", percent: 0, error: null, hardwareID }),
++  setInstalling: () => set({ stage: "installing", percent: null }),
+   setAssets: (percent) => set({ stage: "assets", percent }),
+   setSetup: () => set({ stage: "setup", percent: null }),
+   setReady: () => set({ stage: "ready", percent: null, error: null }),
+diff --git a/frontend/tests/apple/sapAssets.test.ts b/frontend/tests/apple/sapAssets.test.ts
+new file mode 100644
+index 0000000..585eeb3
+--- /dev/null
++++ b/frontend/tests/apple/sapAssets.test.ts
+@@ -0,0 +1,197 @@
++import { describe, expect, it, vi, afterEach } from "vitest";
++import { loadAssets } from "../../src/apple/sap/assets";
++
++// The regression this pins down was visible in a real diagnostic report as
++// `stage: assets, percent: 100` while 29 MB of the 38 MB had not been
++// downloaded. The four binaries download in parallel and differ in size by two
++// orders of magnitude, so reporting whichever file spoke last read as 100% the
++// moment the 207 KB one landed.
++
++const SIZES: Record<string, number> = {
++  CommerceKit: 100,
++  CommerceCore: 20, // lands almost immediately, the way the real 207 KB one does
++  CoreFP: 1000, // the big one, still in flight
++  "CoreFP.icxs": 300,
++};
++
++const TOTAL = Object.values(SIZES).reduce((a, b) => a + b, 0);
++
++function streamOf(bytes: Uint8Array, chunkSize: number) {
++  let offset = 0;
++  return new ReadableStream<Uint8Array>({
++    pull(controller) {
++      if (offset >= bytes.length) {
++        controller.close();
++        return;
++      }
++      const end = Math.min(offset + chunkSize, bytes.length);
++      controller.enqueue(bytes.slice(offset, end));
++      offset = end;
++    },
++  });
++}
++
++/**
++ * Stubs fetch so that every asset is "ready" on the server, HEAD answers with
++ * the size, and GET streams — except that CoreFP never finishes, which is the
++ * state a real deployment sits in for most of the download.
++ */
++function stubFetch(opts: { stallCoreFP?: boolean } = {}) {
++  const requests: string[] = [];
++
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++      const url = String(input);
++      requests.push(`${init?.method ?? "GET"} ${url}`);
++
++      if (url === "/api/sap/assets") {
++        return new Response(
++          JSON.stringify({
++            ready: true,
++            fetching: false,
++            available: Object.keys(SIZES),
++            missing: [],
++            corrupt: [],
++            progress: null,
++            error: null,
++          }),
++          { status: 200 },
++        );
++      }
++
++      const name = url.replace("/api/sap/assets/", "");
++      const size = SIZES[name];
++      if (size === undefined) return new Response("nope", { status: 404 });
++
++      if (init?.method === "HEAD") {
++        return new Response(null, {
++          status: 200,
++          headers: { "Content-Length": String(size) },
++        });
++      }
++
++      if (opts.stallCoreFP && name === "CoreFP") {
++        // Emits one chunk then never resolves, so the promise stays pending
++        // exactly as an in-flight 29 MB download does.
++        return new Response(
++          new ReadableStream<Uint8Array>({
++            start(controller) {
++              controller.enqueue(new Uint8Array(50));
++            },
++          }),
++          { status: 200, headers: { "Content-Length": String(size) } },
++        );
++      }
++
++      return new Response(streamOf(new Uint8Array(size).fill(7), 10), {
++        status: 200,
++        headers: { "Content-Length": String(size) },
++      });
++    }),
++  );
++
++  return requests;
++}
++
++/** Runs loadAssets but gives up once the stall means it cannot finish. */
++function loadUntilStalled(onProgress: (p: { loaded: number; total: number }) => void) {
++  const pending = loadAssets({}, onProgress);
++  // Swallow the rejection: the stalled stream leaves this unresolved forever,
++  // and an unhandled rejection would fail the run for the wrong reason.
++  pending.catch(() => {});
++  return pending;
++}
++
++describe("SAP asset progress", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("does not report 100% while most of the bytes are still missing", async () => {
++    stubFetch({ stallCoreFP: true });
++
++    const seen: number[] = [];
++    loadUntilStalled((p) => {
++      if (p.total > 0) seen.push(Math.round((p.loaded / p.total) * 100));
++    });
++
++    // Let the three small downloads finish and their progress arrive.
++    await new Promise((resolve) => setTimeout(resolve, 200));
++
++    expect(seen.length).toBeGreaterThan(0);
++
++    // The three that finished are 100 + 20 + 300 of 1420 bytes, plus the 50
++    // CoreFP had emitted: about 33%. The old code's last message here came
++    // from CommerceCore completing, and said 100%.
++    expect(Math.max(...seen)).toBeLessThan(50);
++    expect(seen).not.toContain(100);
++  });
++
++  it("reaches 100% only when everything is actually in hand", async () => {
++    stubFetch();
++
++    const seen: { loaded: number; total: number }[] = [];
++    await loadAssets({}, (p) => seen.push({ loaded: p.loaded, total: p.total }));
++
++    const last = seen[seen.length - 1];
++    expect(last.total).toBe(TOTAL);
++    expect(last.loaded).toBe(TOTAL);
++  });
++
++  it("reports every byte it is given, not just the last file's", async () => {
++    stubFetch();
++
++    const seen: number[] = [];
++    await loadAssets({}, (p) => seen.push(p.loaded));
++
++    // Monotonic: progress is accumulated across files, so it can never go
++    // backwards the way per-file reporting did when a small file finished
++    // after a large one had made headway.
++    for (let i = 1; i < seen.length; i += 1) {
++      expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);
++    }
++  });
++
++  it("sizes the assets up front so the total is real", async () => {
++    const requests = stubFetch();
++
++    await loadAssets({}, () => {});
++
++    const heads = requests.filter((r) => r.startsWith("HEAD "));
++    expect(heads).toHaveLength(Object.keys(SIZES).length);
++  });
++
++  it("still downloads when HEAD is refused, without inventing a total", async () => {
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
++        const url = String(input);
++        if (url === "/api/sap/assets") {
++          return new Response(
++            JSON.stringify({ ready: true, missing: [], corrupt: [], error: null }),
++            { status: 200 },
++          );
++        }
++        if (init?.method === "HEAD") return new Response(null, { status: 405 });
++
++        const name = url.replace("/api/sap/assets/", "");
++        const size = SIZES[name];
++        return new Response(new Uint8Array(size).fill(7), {
++          status: 200,
++          headers: { "Content-Length": String(size) },
++        });
++      }),
++    );
++
++    const seen: { loaded: number; total: number }[] = [];
++    await loadAssets({}, (p) => seen.push({ loaded: p.loaded, total: p.total }));
++
++    // No cross-file total is known, so it falls back to per-file numbers
++    // rather than a percentage computed against a wrong denominator.
++    expect(seen.every((p) => p.total > 0)).toBe(true);
++    expect(seen.every((p) => p.total <= Math.max(...Object.values(SIZES)))).toBe(
++      true,
++    );
++  });
++});
+diff --git a/frontend/tests/components/DiagnosticsModal.test.tsx b/frontend/tests/components/DiagnosticsModal.test.tsx
+index e2f8d4e..3f0bd6b 100644
+--- a/frontend/tests/components/DiagnosticsModal.test.tsx
++++ b/frontend/tests/components/DiagnosticsModal.test.tsx
+@@ -94,6 +94,20 @@ describe("DiagnosticsModal", () => {
+     expect(report).toContain("stage: assets");
+   });
+ 
++  it("distinguishes the server downloading the binaries from the phone downloading them", async () => {
++    vi.mocked(apiGet).mockImplementation(async (path: string) =>
++      path === "/api/settings" ? ({ buildCommit: "3bc9515" } as any) : ({ ready: true } as any),
++    );
++    // The stage a first-time visitor actually sits in: the server is still
++    // pulling 38 MB from Apple, so there is no honest percentage to show.
++    useSapStore.setState({ stage: "installing", percent: null, error: null, hardwareID: "a1b2" } as any);
++
++    const { default: SapStatus } = await import("../../src/components/common/SapStatus");
++    const { container } = render(<SapStatus />);
++
++    expect(container.textContent).toBe("accounts.addForm.installingAssets");
++  });
++
+   it("copies the report to the clipboard on request", async () => {
+     vi.mocked(apiGet).mockImplementation(async (path: string) =>
+       path === "/api/settings" ? ({ buildCommit: "3bc9515" } as any) : ({ ready: true } as any),
+-- 
+2.39.5
+

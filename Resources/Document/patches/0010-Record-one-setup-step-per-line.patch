@@ -1,0 +1,254 @@
+From e04bd7abb0d3c5fb6bfcdcbc665ba9b807f8d013 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 12:30:14 +0000
+Subject: [PATCH] Record one setup step per line
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The first report with a timeline in it printed every step twice — once as
+STILL RUNNING and once with a duration — because the store kept a step's begin
+and its end as two entries and the timeline printed each entry as it came.
+
+recordEvent now folds an end into the open entry for the same step, and the
+timeline also collapses a paired begin and end if it is handed one. Only the
+trailing open entry folds, so a signer rebuilt mid-session appends a fresh
+machine.open instead of editing the cost recorded for the first.
+
+Correcting something said alongside the previous commit: stuckInStep was never
+wrong. A step's begin and end carry the same label and the same start
+timestamp, so scanning back to either gives the same answer — feeding the
+report's own event list to the deployed build returns exchange.1, which is what
+the report said. The timeline duplicated; the conclusion above it was right.
+The runningStep change made for that misreading has been dropped.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/store/sap.ts                     | 25 +++++++-
+ frontend/src/utils/diagnostics.ts             | 48 ++++++++++++---
+ frontend/tests/store/sap.test.ts              | 61 +++++++++++++++++++
+ .../utils/diagnosticsSetupTimeline.test.ts    | 40 ++++++++++++
+ 4 files changed, 161 insertions(+), 13 deletions(-)
+ create mode 100644 frontend/tests/store/sap.test.ts
+
+diff --git a/frontend/src/store/sap.ts b/frontend/src/store/sap.ts
+index 7f717cf..2a31eb8 100644
+--- a/frontend/src/store/sap.ts
++++ b/frontend/src/store/sap.ts
+@@ -101,9 +101,28 @@ export const useSapStore = create<SapStore>((set) => ({
+   setError: (message) =>
+     set({ stage: "error", percent: null, setupStartedAt: null, error: message }),
+   recordEvent: (event) =>
+-    set((state) => ({
+-      events: [...state.events, event].slice(-MAX_EVENTS),
+-    })),
++    set((state) => {
++      // A step's end arrives as a second event for the same label. Folding it
++      // into the entry already there keeps one line per step; appending it
++      // instead left the begin entry behind, so the list read as though every
++      // finished step were also still running.
++      //
++      // Only the trailing open entry for that label is folded, so a signer
++      // rebuilt mid-session appends a fresh machine.open rather than editing
++      // the recorded cost of the first one.
++      for (let index = state.events.length - 1; index >= 0; index--) {
++        const existing = state.events[index];
++        if (existing.label !== event.label) continue;
++        if (existing.endedAt === undefined && event.endedAt !== undefined) {
++          const folded = state.events.slice();
++          folded[index] = { ...existing, endedAt: event.endedAt };
++          return { events: folded };
++        }
++        break;
++      }
++
++      return { events: [...state.events, event].slice(-MAX_EVENTS) };
++    }),
+ }));
+ 
+ /** A human-readable line for the current stage, or null when there is nothing to say. */
+diff --git a/frontend/src/utils/diagnostics.ts b/frontend/src/utils/diagnostics.ts
+index 89c54db..8bb3b86 100644
+--- a/frontend/src/utils/diagnostics.ts
++++ b/frontend/src/utils/diagnostics.ts
+@@ -107,10 +107,11 @@ export function maskHardwareID(id: string | null): string | null {
+ /**
+  * The step setup is in right now, or null if every recorded step has ended.
+  *
+- * The list is chronological and a step's end arrives as a second entry for the
+- * same label, so the last entry that has no `endedAt` is the one still running.
+- * That single value is what turns "stage: setup" — which says only that
+- * something is happening — into an answer.
++ * The last entry with no `endedAt` is the step still running. Its begin and
++ * end carry the same label and the same start timestamp, so scanning back to
++ * the begin entry of the final step gives the same answer as the end would —
++ * which is what turns "stage: setup", which says only that something is
++ * happening, into an answer.
+  */
+ export function runningStep(events: SapEvent[]): SapEvent | null {
+   for (let index = events.length - 1; index >= 0; index--) {
+@@ -131,13 +132,40 @@ function setupTimeline(events: SapEvent[]): string[] {
+   if (events.length === 0) return ["  none recorded"];
+ 
+   const startedAt = events[0].at;
+-  const at = (timestamp: number) => `+${((timestamp - startedAt) / 1000).toFixed(1)}s`;
++  const at = (timestamp: number) =>
++    `+${((timestamp - startedAt) / 1000).toFixed(1)}s`;
+ 
+-  return events.map((event) =>
+-    event.endedAt !== undefined
+-      ? `  ${event.label}  ${at(event.at)}  took ${((event.endedAt - event.at) / 1000).toFixed(1)}s`
+-      : `  ${event.label}  ${at(event.at)}  STILL RUNNING`,
+-  );
++  // One line per step. Where a begin and an end were recorded as separate
++  // entries, the end is the one worth printing; a begin with nothing after it
++  // is the step still in progress.
++  const lines: string[] = [];
++  for (let index = 0; index < events.length; index++) {
++    const event = events[index];
++    const supersededBy = events.findIndex(
++      (later, position) => position > index && later.label === event.label,
++    );
++
++    if (supersededBy !== -1) {
++      const end = events[supersededBy];
++      index = supersededBy;
++      if (end.endedAt === undefined) {
++        lines.push(`  ${end.label}  ${at(end.at)}  STILL RUNNING`);
++        continue;
++      }
++      lines.push(
++        `  ${end.label}  ${at(end.at)}  took ${((end.endedAt - end.at) / 1000).toFixed(1)}s`,
++      );
++      continue;
++    }
++
++    lines.push(
++      event.endedAt !== undefined
++        ? `  ${event.label}  ${at(event.at)}  took ${((event.endedAt - event.at) / 1000).toFixed(1)}s`
++        : `  ${event.label}  ${at(event.at)}  STILL RUNNING`,
++    );
++  }
++
++  return lines;
+ }
+ 
+ function line(label: string, value: unknown): string {
+diff --git a/frontend/tests/store/sap.test.ts b/frontend/tests/store/sap.test.ts
+new file mode 100644
+index 0000000..d4132ca
+--- /dev/null
++++ b/frontend/tests/store/sap.test.ts
+@@ -0,0 +1,61 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import { useSapStore } from "../../src/store/sap";
++
++// A real report arrived with every step listed twice — once as STILL RUNNING
++// and once with a duration — and stuckInStep naming a step that had already
++// finished. Both came from keeping the begin entry around after the end
++// arrived.
++
++const T0 = Date.parse("2026-09-06T12:20:00.000Z");
++
++describe("recording setup steps", () => {
++  beforeEach(() => {
++    useSapStore.setState({ events: [], stage: "idle", percent: null, setupStartedAt: null, error: null, hardwareID: null });
++  });
++
++  it("folds a step's end into its begin instead of appending a second entry", () => {
++    const { recordEvent } = useSapStore.getState();
++
++    recordEvent({ label: "machine.open", at: T0 });
++    recordEvent({ label: "machine.open", at: T0, endedAt: T0 + 1300 });
++
++    expect(useSapStore.getState().events).toEqual([
++      { label: "machine.open", at: T0, endedAt: T0 + 1300 },
++    ]);
++  });
++
++  it("keeps steps in order and leaves the running one open", () => {
++    const { recordEvent } = useSapStore.getState();
++
++    recordEvent({ label: "machine.open", at: T0 });
++    recordEvent({ label: "machine.open", at: T0, endedAt: T0 + 1300 });
++    recordEvent({ label: "machine.initialize", at: T0 + 1300 });
++    recordEvent({ label: "machine.initialize", at: T0 + 1300, endedAt: T0 + 74_200 });
++    recordEvent({ label: "exchange.1", at: T0 + 74_600 });
++
++    const { events } = useSapStore.getState();
++    expect(events.map((event) => event.label)).toEqual([
++      "machine.open",
++      "machine.initialize",
++      "exchange.1",
++    ]);
++    // The one genuinely in progress has no end.
++    expect(events[2].endedAt).toBeUndefined();
++  });
++
++  it("treats a second attempt as a new step rather than folding into the first", () => {
++    const { recordEvent } = useSapStore.getState();
++
++    recordEvent({ label: "machine.open", at: T0 });
++    recordEvent({ label: "machine.open", at: T0, endedAt: T0 + 1300 });
++    // A rebuilt signer starts over; its machine.open must not overwrite the
++    // recorded cost of the first one.
++    recordEvent({ label: "machine.open", at: T0 + 60_000 });
++
++    const { events } = useSapStore.getState();
++    expect(events).toHaveLength(2);
++    expect(events[0].endedAt).toBe(T0 + 1300);
++    expect(events[1].at).toBe(T0 + 60_000);
++    expect(events[1].endedAt).toBeUndefined();
++  });
++});
+diff --git a/frontend/tests/utils/diagnosticsSetupTimeline.test.ts b/frontend/tests/utils/diagnosticsSetupTimeline.test.ts
+index 40cce7f..b40cf8f 100644
+--- a/frontend/tests/utils/diagnosticsSetupTimeline.test.ts
++++ b/frontend/tests/utils/diagnosticsSetupTimeline.test.ts
+@@ -105,3 +105,43 @@ describe("the report", () => {
+     expect(report).toContain("none recorded");
+   });
+ });
++
++describe("a report built from the paired entries an older build recorded", () => {
++  // Verbatim from a field report: every step appears twice, once as a begin
++  // and once carrying its end, so the timeline printed each step on two lines
++  // and claimed every finished one was STILL RUNNING. stuckInStep was right —
++  // the begin and end of the final step share a label and a timestamp, so
++  // scanning back to either gives the same answer. The timeline was the
++  // defect, not the conclusion above it.
++  const T = Date.parse("2026-09-06T12:20:00.000Z");
++  const paired: SapEvent[] = [
++    { label: "machine.open", at: T },
++    { label: "machine.open", at: T, endedAt: T + 1300 },
++    { label: "machine.initialize", at: T + 1300 },
++    { label: "machine.initialize", at: T + 1300, endedAt: T + 74_200 },
++    { label: "certificate.fetch", at: T + 74_100 },
++    { label: "certificate.fetch", at: T + 74_100, endedAt: T + 74_600 },
++    { label: "exchange.1", at: T + 74_600 },
++  ];
++
++  it("still names the step actually in progress", () => {
++    expect(runningStep(paired)?.label).toBe("exchange.1");
++  });
++
++  it("prints one line per step, and marks only the running one", () => {
++    const report = buildDiagnostics(input(paired, 140));
++
++    expect(report).toContain("stuckInStep: exchange.1 for");
++    expect(report).toContain("machine.open  +0.0s  took 1.3s");
++    expect(report).toContain("machine.initialize  +1.3s  took 72.9s");
++    expect(report).toContain("certificate.fetch  +74.1s  took 0.5s");
++    expect(report).toContain("exchange.1  +74.6s  STILL RUNNING");
++
++    // One line per step: the duplication was the whole defect.
++    const stepLines = report
++      .split("\n")
++      .filter((entry) => /^  \S+  \+\d/.test(entry));
++    expect(stepLines).toHaveLength(4);
++    expect(report.match(/STILL RUNNING/g)).toHaveLength(1);
++  });
++});
+-- 
+2.39.5
+

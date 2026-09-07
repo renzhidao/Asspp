@@ -1,0 +1,167 @@
+From 45313fc953a5c245f3271fa65e2eb16fc34c074c Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 17:14:43 +0000
+Subject: [PATCH] Report an empty failureType instead of stepping over it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Deployed and retried, neither error carried a code, and both carried Apple's
+words. Only one thing explains both: failureType arrives as an empty string.
+Empty is falsy, so `if (dict.failureType)` skips the whole block in download.ts
+and in versionFinder.ts, and every `failureType ? code : ""` prints nothing —
+while the response's key list still names it, which read as a code withheld
+rather than a code never sent.
+
+The version-history line settled it: after the previous patch every coded
+branch carries parentheses, and the one that printed bare "No items in
+response" was the branch those checks fall through to.
+
+So Apple answers these apps with "App Not Available" and an empty failureType.
+There is no code to recover. The three states are now printed distinctly —
+code=9008, code=empty, code=absent — so an empty one can never again look like
+a missing one.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts             | 35 +++++++++++++---------
+ frontend/src/apple/versionFinder.ts        | 16 +++++++++-
+ frontend/tests/apple/download.test.ts      | 23 ++++++++++++++
+ frontend/tests/apple/versionFinder.test.ts | 18 +++++++++++
+ 4 files changed, 77 insertions(+), 15 deletions(-)
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index de156a4..d551904 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -134,22 +134,29 @@ export async function getDownloadInfo(
+ 
+     const songList = dict.songList as Record<string, any>[] | undefined;
+     if (!songList || songList.length === 0) {
+-      // Apple answered without a failureType and without an item. The answer
+-      // is not empty — it says something about why there is nothing to give —
+-      // and throwing it away turned every one of these into the same dead end.
+-      // The storefront is the usual reason: the app is not licensable there.
+-      const customerMessage = dict.customerMessage as string | undefined;
++      // Apple answered with no item. What it did send is the only evidence
++      // there is, so all of it goes out — including the fact that a field is
++      // empty, which is what turned out to be the interesting part here:
++      // failureType arrives as an empty string, and an empty string is falsy,
++      // so every check of the form `if (dict.failureType)` above silently
++      // stepped over it and every attempt to print the code printed nothing.
++      const customerMessage =
++        typeof dict.customerMessage === "string" && dict.customerMessage
++          ? dict.customerMessage
++          : undefined;
++      const code =
++        dict.failureType === undefined || dict.failureType === null
++          ? "absent"
++          : String(dict.failureType) === ""
++            ? "empty"
++            : String(dict.failureType);
+       const keys = Object.keys(dict).filter((key) => key !== "dialog");
+-      const evidence = [
+-        customerMessage,
+-        dict.failureType ? `code=${dict.failureType}` : "",
+-        `store=${account.store}`,
+-        `keys=${keys.join(",") || "none"}`,
+-      ]
+-        .filter(Boolean)
+-        .join(" ");
+       throw new DownloadError(
+-        `${i18n.t("errors.download.noItems")} (${evidence})`,
++        `${customerMessage ?? i18n.t("errors.download.noItems")} ` +
++          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"})`,
++        typeof dict.failureType === "string" && dict.failureType
++          ? dict.failureType
++          : undefined,
+       );
+     }
+ 
+diff --git a/frontend/src/apple/versionFinder.ts b/frontend/src/apple/versionFinder.ts
+index 393a44e..52f921c 100644
+--- a/frontend/src/apple/versionFinder.ts
++++ b/frontend/src/apple/versionFinder.ts
+@@ -94,7 +94,21 @@ export async function listVersions(
+           }
+         }
+       }
+-      throw new Error("No items in response");
++      // failureType is absent or empty here too — see download.ts. Print the
++      // distinction rather than a message that looks like the coded ones.
++      const code =
++        dict.failureType === undefined || dict.failureType === null
++          ? "absent"
++          : String(dict.failureType) === ""
++            ? "empty"
++            : String(dict.failureType);
++      const customerMessage =
++        typeof dict.customerMessage === "string" && dict.customerMessage
++          ? dict.customerMessage
++          : undefined;
++      throw new Error(
++        `${customerMessage ?? "No items in response"} (code=${code})`,
++      );
+     }
+ 
+     const item = songList[0];
+diff --git a/frontend/tests/apple/download.test.ts b/frontend/tests/apple/download.test.ts
+index 4eee849..067b5ed 100644
+--- a/frontend/tests/apple/download.test.ts
++++ b/frontend/tests/apple/download.test.ts
+@@ -67,3 +67,26 @@ describe("the volumeStore refusal", () => {
+     expect(error.code).toBe("9008");
+   });
+ });
++
++// The response that actually arrives from the field: failureType present but
++// empty, customerMessage present. An empty string is falsy, so every
++// `if (dict.failureType)` check steps over it and the code never gets printed.
++describe("an empty failureType", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("is reported as empty, not silently omitted", async () => {
++    respond({
++      failureType: "",
++      customerMessage: "App Not Available",
++    });
++
++    const error = await getDownloadInfo(account, app).catch((e) => e);
++
++    expect(error).toBeInstanceOf(DownloadError);
++    expect(error.message).toContain("App Not Available");
++    expect(error.message).toContain("code=empty");
++    // The keys still list it, which is what made the old output look as though
++    // a code had been withheld rather than never sent.
++    expect(error.message).toContain("failureType");
++  });
++});
+diff --git a/frontend/tests/apple/versionFinder.test.ts b/frontend/tests/apple/versionFinder.test.ts
+index 4787e2c..818d9fe 100644
+--- a/frontend/tests/apple/versionFinder.test.ts
++++ b/frontend/tests/apple/versionFinder.test.ts
+@@ -56,3 +56,21 @@ describe("version history refusals", () => {
+     );
+   });
+ });
++
++describe("an empty failureType", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("is reported as empty", async () => {
++    respond({ failureType: "", customerMessage: "App Not Available" });
++
++    await expect(listVersions(account, app)).rejects.toThrow(
++      /App Not Available \(code=empty\)/,
++    );
++  });
++
++  it("distinguishes absent from empty", async () => {
++    respond({ customerMessage: "App Not Available" });
++
++    await expect(listVersions(account, app)).rejects.toThrow(/code=absent/);
++  });
++});
+-- 
+2.39.5
+

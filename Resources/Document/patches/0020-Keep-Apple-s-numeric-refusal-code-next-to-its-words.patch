@@ -1,0 +1,133 @@
+From 6023c20026f32a8c8e84b8384146eb580fc757c0 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 16:31:08 +0000
+Subject: [PATCH] Keep Apple's numeric refusal code next to its words
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The desktop report finally named the reason: "App Not Available", from a
+buyProduct response, for an app that is live and free in the account's
+storefront — 番茄小说, id 1468454200, iPhone/iPad/iPod, number one in Books.
+So the words are not saying the app is missing. Something else refused it, and
+the numeric failureType that would say what was in the response and being
+thrown away whenever a customerMessage was present.
+
+purchase.ts now appends the code, and the download's empty-songList evidence
+carries it too.
+
+Which rule refused it is still unknown. This is what makes the next one legible.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts        |  1 +
+ frontend/src/apple/purchase.ts        | 15 +++++--
+ frontend/tests/apple/purchase.test.ts | 58 +++++++++++++++++++++++++++
+ 3 files changed, 70 insertions(+), 4 deletions(-)
+ create mode 100644 frontend/tests/apple/purchase.test.ts
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index b879f0d..b0a2a99 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -131,6 +131,7 @@ export async function getDownloadInfo(
+       const keys = Object.keys(dict).filter((key) => key !== "dialog");
+       const evidence = [
+         customerMessage,
++        dict.failureType ? `code=${dict.failureType}` : "",
+         `store=${account.store}`,
+         `keys=${keys.join(",") || "none"}`,
+       ]
+diff --git a/frontend/src/apple/purchase.ts b/frontend/src/apple/purchase.ts
+index 71e33a8..7462953 100644
+--- a/frontend/src/apple/purchase.ts
++++ b/frontend/src/apple/purchase.ts
+@@ -139,10 +139,17 @@ async function purchaseWithParams(
+           msg = i18n.t("errors.purchase.unknownError");
+         }
+ 
+-        throw new PurchaseError(
+-          msg ?? i18n.t("errors.purchase.failed", { failureType }),
+-          failureType,
+-        );
++        if (!msg) {
++          throw new PurchaseError(
++            i18n.t("errors.purchase.failed", { failureType }),
++            failureType,
++          );
++        }
++        // Apple's words alone are not enough: "App Not Available" is what came
++        // back for an app that is live and free in the account's storefront, so
++        // the words do not say which rule refused it. The numeric code does,
++        // and it was being thrown away whenever a message was present.
++        throw new PurchaseError(`${msg} (${failureType})`, failureType);
+       }
+     }
+   }
+diff --git a/frontend/tests/apple/purchase.test.ts b/frontend/tests/apple/purchase.test.ts
+new file mode 100644
+index 0000000..16936d7
+--- /dev/null
++++ b/frontend/tests/apple/purchase.test.ts
+@@ -0,0 +1,58 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++// "App Not Available" came back for an app that is live and free in the
++// account's storefront. The words do not say which rule refused it; Apple's
++// numeric failureType does, and it was discarded whenever a message was present.
++
++const appleRequest = vi.hoisted(() => vi.fn());
++
++vi.mock("../../src/apple/request", () => ({ appleRequest }));
++vi.mock("../../src/i18n", () => ({
++  default: {
++    t: (key: string, opts?: Record<string, unknown>) =>
++      opts ? `${key}:${JSON.stringify(opts)}` : key,
++  },
++}));
++
++const { purchaseApp, PurchaseError } = await import("../../src/apple/purchase");
++
++const account = {
++  email: "a@example.com",
++  passwordToken: "t",
++  directoryServicesIdentifier: "d",
++  store: "143465",
++  cookies: [],
++  deviceIdentifier: "g",
++} as never;
++
++const app = { id: "1468454200", name: "番茄小说", price: 0 } as never;
++
++/** A real plist, in the shape Apple actually answers with. */
++function respond(fields: Record<string, string>) {
++  const body = Object.entries(fields)
++    .map(([key, value]) => `    <key>${key}</key>\n    <string>${value}</string>`)
++    .join("\n");
++  appleRequest.mockResolvedValue({
++    status: 200,
++    body: `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n  <dict>\n${body}\n  </dict>\n</plist>`,
++    headers: {},
++    rawHeaders: [],
++  });
++}
++
++describe("purchase failures", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("keeps Apple's numeric code next to its words", async () => {
++    respond({
++      failureType: "9008",
++      customerMessage: "App Not Available",
++    });
++
++    const error = await purchaseApp(account, app).catch((e) => e);
++    expect(error).toBeInstanceOf(PurchaseError);
++    // The code is what distinguishes one refusal from another.
++    expect(error.message).toContain("9008");
++    expect(error.code).toBe("9008");
++  });
++});
+-- 
+2.39.5
+

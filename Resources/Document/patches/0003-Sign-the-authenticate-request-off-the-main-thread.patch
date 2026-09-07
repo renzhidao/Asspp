@@ -1,0 +1,485 @@
+From c6f35c0c9a19939e5dbf84e40286aac7db8e586f Mon Sep 17 00:00:00 2001
+From: Tardisyuan <richard56500620@126.com>
+Date: Tue, 1 Sep 2026 20:34:59 +1000
+Subject: [PATCH 3/5] Sign the authenticate request, off the main thread
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Wires the signer into sign-in: authenticate prepares one and sends
+X-Apple-ActionSignature with the request.
+
+Preparing it runs about ten million emulated instructions — roughly 35 s on
+WebKit, 115 s on Chrome — and each signature a few million more, so both
+happen in a Web Worker rather than freezing the tab. The signer starts
+preparing as soon as there is an account to bind it to, so a button pressed
+later usually finds it ready, and SapStatus shows whatever progress is under
+way rather than leaving a button looking dead.
+
+A signer is bound to the hardware id it was initialised with, so it is rebuilt
+when that changes rather than signing with another account's identity. And
+re-authenticating refuses immediately when an account has no password rather
+than spending two minutes preparing a signer it cannot use.
+
+Vite needs worker.format "es": the worker loads unicorn.js dynamically, and a
+code-splitting build cannot emit that as IIFE.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ frontend/src/apple/authenticate.ts            | 20 +++++++
+ .../src/components/Account/AccountDetail.tsx  | 12 +++++
+ .../src/components/Account/AddAccountForm.tsx |  2 +
+ .../src/components/Search/ProductDetail.tsx   |  4 ++
+ frontend/src/components/common/SapStatus.tsx  | 35 ++++++++++++
+ frontend/src/hooks/useSapWarmup.ts            | 33 ++++++++++++
+ frontend/src/locales/en-US.json               |  5 ++
+ frontend/src/locales/ja.json                  |  7 ++-
+ frontend/src/locales/ko.json                  |  5 ++
+ frontend/src/locales/ru.json                  |  7 ++-
+ frontend/src/locales/zh-CN.json               |  5 ++
+ frontend/src/locales/zh-TW.json               |  5 ++
+ frontend/src/store/sap.ts                     | 54 +++++++++++++++++++
+ 13 files changed, 192 insertions(+), 2 deletions(-)
+ create mode 100644 frontend/src/components/common/SapStatus.tsx
+ create mode 100644 frontend/src/hooks/useSapWarmup.ts
+ create mode 100644 frontend/src/store/sap.ts
+
+diff --git a/frontend/src/apple/authenticate.ts b/frontend/src/apple/authenticate.ts
+index 61550f0..2590140 100644
+--- a/frontend/src/apple/authenticate.ts
++++ b/frontend/src/apple/authenticate.ts
+@@ -3,8 +3,16 @@ import { appleRequest } from "./request";
+ import { buildPlist, parsePlist } from "./plist";
+ import { extractAndMergeCookies } from "./cookies";
+ import { fetchBag, defaultAuthURL } from "./bag";
++import { prepareSigner, signAction, type SetupProgress } from "./sap/client";
+ import i18n from "../i18n";
+ 
++/** The signature travels in a header, so it goes out base64-encoded. */
++function base64(bytes: Uint8Array): string {
++  let binary = "";
++  for (const byte of bytes) binary += String.fromCharCode(byte);
++  return btoa(binary);
++}
++
+ export class AuthenticationError extends Error {
+   constructor(
+     message: string,
+@@ -21,11 +29,18 @@ export async function authenticate(
+   code?: string,
+   existingCookies?: Cookie[],
+   deviceId: string = "",
++  onProgress?: (progress: SetupProgress) => void,
+ ): Promise<Account> {
+   let cookies: Cookie[] = existingCookies ? [...existingCookies] : [];
+   let storeFront = "";
+   let lastError: Error | null = null;
+ 
++  // Apple gates this endpoint behind a SAP signature, and producing one means
++  // emulating Apple's own signing code — slow enough to want a progress
++  // report, and done off the main thread. Nothing in the setup sees the
++  // password: it only needs the device identifier.
++  await prepareSigner(deviceId, onProgress);
++
+   const defaultAuthEndpoint = new URL(defaultAuthURL);
+   defaultAuthEndpoint.searchParams.set("guid", deviceId);
+   let requestHost = defaultAuthEndpoint.hostname;
+@@ -55,8 +70,13 @@ export async function authenticate(
+ 
+       const plistBody = buildPlist(body);
+ 
++      // Signing takes about twelve seconds, so say so rather than going quiet.
++      onProgress?.({ phase: "signing" });
++      const signature = await signAction(new TextEncoder().encode(plistBody));
++
+       const headers: Record<string, string> = {
+         "Content-Type": "application/x-apple-plist",
++        "X-Apple-ActionSignature": base64(signature),
+       };
+ 
+       const response = await appleRequest({
+diff --git a/frontend/src/components/Account/AccountDetail.tsx b/frontend/src/components/Account/AccountDetail.tsx
+index 654cc67..be0da33 100644
+--- a/frontend/src/components/Account/AccountDetail.tsx
++++ b/frontend/src/components/Account/AccountDetail.tsx
+@@ -3,6 +3,7 @@ import { useParams, useNavigate } from "react-router-dom";
+ import { useTranslation } from "react-i18next";
+ import PageContainer from "../Layout/PageContainer";
+ import Spinner from "../common/Spinner";
++import SapStatus from "../common/SapStatus";
+ import { useAccounts } from "../../hooks/useAccounts";
+ import { useToastStore } from "../../store/toast";
+ import { authenticate, AuthenticationError } from "../../apple/authenticate";
+@@ -60,6 +61,15 @@ export default function AccountDetail() {
+ 
+   async function handleReauth() {
+     if (!account) return;
++
++    // An account imported as a token bundle carries no password. Signing in
++    // needs one, and trying anyway would spend a minute or two preparing the
++    // SAP signer before failing on an empty field.
++    if (!account.password) {
++      addToast(t("accounts.detail.noPassword"), "error");
++      return;
++    }
++
+     setReauthing(true);
+ 
+     try {
+@@ -166,6 +176,7 @@ export default function AccountDetail() {
+                 {reauthing && <Spinner />}
+                 {t("accounts.detail.verify")}
+               </button>
++              <SapStatus />
+             </div>
+           </section>
+         )}
+@@ -179,6 +190,7 @@ export default function AccountDetail() {
+             {reauthing && <Spinner />}
+             {t("accounts.detail.reauth")}
+           </button>
++          <SapStatus />
+ 
+           {!showDelete ? (
+             <button
+diff --git a/frontend/src/components/Account/AddAccountForm.tsx b/frontend/src/components/Account/AddAccountForm.tsx
+index 067e4de..decf1bc 100644
+--- a/frontend/src/components/Account/AddAccountForm.tsx
++++ b/frontend/src/components/Account/AddAccountForm.tsx
+@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
+ import { useTranslation } from "react-i18next";
+ import PageContainer from "../Layout/PageContainer";
+ import Spinner from "../common/Spinner";
++import SapStatus from "../common/SapStatus";
+ import { useAccounts } from "../../hooks/useAccounts";
+ import { useToastStore } from "../../store/toast";
+ import { authenticate, AuthenticationError } from "../../apple/authenticate";
+@@ -177,6 +178,7 @@ export default function AddAccountForm() {
+             >
+               {t("accounts.addForm.cancel")}
+             </button>
++            <SapStatus />
+           </div>
+         </form>
+       </div>
+diff --git a/frontend/src/components/Search/ProductDetail.tsx b/frontend/src/components/Search/ProductDetail.tsx
+index 3c70370..235b25c 100644
+--- a/frontend/src/components/Search/ProductDetail.tsx
++++ b/frontend/src/components/Search/ProductDetail.tsx
+@@ -5,6 +5,7 @@ import PageContainer from "../Layout/PageContainer";
+ import Alert from '../common/Alert';
+ import AppIcon from "../common/AppIcon";
+ import Spinner from '../common/Spinner';
++import SapStatus from "../common/SapStatus";
+ import {
+   isProductPreviewEnabled,
+   previewProductAccounts,
+@@ -244,6 +245,9 @@ export default function ProductDetail() {
+               >
+                 {t("search.product.versionHistory")}
+               </Link>
++              <div className="flex items-center">
++                <SapStatus />
++              </div>
+             </div>
+           </section>
+         )}
+diff --git a/frontend/src/components/common/SapStatus.tsx b/frontend/src/components/common/SapStatus.tsx
+new file mode 100644
+index 0000000..cd0bad6
+--- /dev/null
++++ b/frontend/src/components/common/SapStatus.tsx
+@@ -0,0 +1,35 @@
++import { useTranslation } from "react-i18next";
++import { useSapStore } from "../../store/sap";
++
++/**
++ * What the SAP signer is doing, for screens with a button that will wait on
++ * it. Renders nothing when it is idle or ready, so it can be dropped in
++ * without reserving space for the common case.
++ *
++ * The signer starts preparing in the background on load, so this is usually
++ * showing progress already under way rather than something a press started.
++ */
++export default function SapStatus() {
++  const { t } = useTranslation();
++  const stage = useSapStore((state) => state.stage);
++  const percent = useSapStore((state) => state.percent);
++  const error = useSapStore((state) => state.error);
++
++  if (stage === "idle" || stage === "ready") return null;
++
++  if (stage === "error") {
++    return (
++      <span className="text-sm text-red-600 dark:text-red-400">
++        {t("accounts.addForm.signerFailed", { error: error ?? "" })}
++      </span>
++    );
++  }
++
++  return (
++    <span className="text-sm text-gray-600 dark:text-gray-400">
++      {stage === "assets"
++        ? t("accounts.addForm.preparingAssets", { percent: percent ?? 0 })
++        : t("accounts.addForm.preparingSigner")}
++    </span>
++  );
++}
+diff --git a/frontend/src/hooks/useSapWarmup.ts b/frontend/src/hooks/useSapWarmup.ts
+new file mode 100644
+index 0000000..280fced
+--- /dev/null
++++ b/frontend/src/hooks/useSapWarmup.ts
+@@ -0,0 +1,33 @@
++import { useEffect } from "react";
++import { useAccountsStore } from "../store/accounts";
++import { useSapStore } from "../store/sap";
++import { prepareSigner } from "../apple/sap/client";
++
++// Starts preparing the SAP signer in the background.
++//
++// It takes a minute or two — 38 MB of Apple binaries, then ten million
++// emulated instructions — so waiting until someone presses a button means
++// that button appears dead for the whole of it. Starting on load instead
++// means the work is usually done, or well along, by the time it is wanted,
++// and a button pressed mid-way can show the progress already being made.
++//
++// Only started once an account exists, because a signer is bound to the
++// hardware id it was initialised with and there is nothing to bind to
++// otherwise. A session that never signs in still pays for the assets, which
++// is why it waits for that signal rather than firing on first paint.
++export function useSapWarmup() {
++  const accounts = useAccountsStore((state) => state.accounts);
++  const stage = useSapStore((state) => state.stage);
++
++  useEffect(() => {
++    if (stage !== "idle") return;
++
++    const device = accounts.find((account) => account.deviceIdentifier)
++      ?.deviceIdentifier;
++    if (!device) return;
++
++    // Fire and forget: the store carries the outcome, and a failure here
++    // should not surface until something actually needs a signature.
++    prepareSigner(device).catch(() => {});
++  }, [accounts, stage]);
++}
+diff --git a/frontend/src/locales/en-US.json b/frontend/src/locales/en-US.json
+index 069cd8c..3f99f6c 100644
+--- a/frontend/src/locales/en-US.json
++++ b/frontend/src/locales/en-US.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "Enter the verification code from your trusted device.",
+       "signIn": "Sign In",
++      "preparingAssets": "Preparing signing components {{percent}}%",
++      "preparingSigner": "Setting up the signer, this takes about a minute…",
++      "signingRequest": "Signing the request…",
++      "signerFailed": "Could not prepare the signer: {{error}}",
+       "verify": "Verify",
+       "cancel": "Cancel",
+       "authFailed": "Authentication failed",
+@@ -131,6 +135,7 @@
+       "code": "2FA Verification Code",
+       "verify": "Verify",
+       "reauth": "Re-authenticate",
++      "noPassword": "This account was imported as a token bundle and has no password to sign in with. Remove it and add it again with an email and password.",
+       "delete": "Delete Account",
+       "confirmDelete": "Confirm Delete",
+       "cancel": "Cancel",
+diff --git a/frontend/src/locales/ja.json b/frontend/src/locales/ja.json
+index e6e7e3b..41656af 100644
+--- a/frontend/src/locales/ja.json
++++ b/frontend/src/locales/ja.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "信頼できるデバイスからの確認コードを入力してください。",
+       "signIn": "サインイン",
++      "preparingAssets": "署名コンポーネントを準備中 {{percent}}%",
++      "preparingSigner": "署名機能を初期化しています。1分ほどかかります…",
++      "signingRequest": "リクエストに署名しています…",
++      "signerFailed": "署名コンポーネントを準備できませんでした: {{error}}",
+       "verify": "確認",
+       "cancel": "キャンセル",
+       "authFailed": "認証に失敗しました",
+@@ -131,6 +135,7 @@
+       "code": "2ファクタ認証コード",
+       "verify": "確認",
+       "reauth": "再認証",
++      "noPassword": "このアカウントはトークンとしてインポートされたため、サインインに使うパスワードがありません。削除して、メールアドレスとパスワードで追加し直してください。",
+       "delete": "アカウントを削除",
+       "confirmDelete": "削除を確認",
+       "cancel": "キャンセル",
+@@ -440,7 +445,7 @@
+     "purchase": {
+       "paidNotSupported": "有料アプリの購入はサポートされていません",
+       "unavailable": "項目は一時的に利用できません",
+-      "passwordExpired": "パスワードトークンの期限が切れています",
++      "passwordExpired": "パスワードトークンの有効期限が切れています",
+       "subscriptionRequired": "サブスクリプションが必要です",
+       "termsRequired": "利用規約に同意する必要があります: {{url}}",
+       "failed": "購入失敗: {{failureType}}",
+diff --git a/frontend/src/locales/ko.json b/frontend/src/locales/ko.json
+index 25fee34..f21fe68 100644
+--- a/frontend/src/locales/ko.json
++++ b/frontend/src/locales/ko.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "신뢰할 수 있는 기기에서 확인 코드를 입력하세요.",
+       "signIn": "로그인",
++      "preparingAssets": "서명 구성요소 준비 중 {{percent}}%",
++      "preparingSigner": "서명기를 초기화하는 중입니다. 1분 정도 걸립니다…",
++      "signingRequest": "요청에 서명하는 중…",
++      "signerFailed": "서명 구성요소를 준비하지 못했습니다: {{error}}",
+       "verify": "확인",
+       "cancel": "취소",
+       "authFailed": "인증 실패",
+@@ -131,6 +135,7 @@
+       "code": "2단계 인증 코드",
+       "verify": "확인",
+       "reauth": "재인증",
++      "noPassword": "이 계정은 토큰 번들로 가져온 것이라 로그인에 쓸 비밀번호가 없습니다. 삭제한 뒤 이메일과 비밀번호로 다시 추가하세요.",
+       "delete": "계정 삭제",
+       "confirmDelete": "삭제 확인",
+       "cancel": "취소",
+diff --git a/frontend/src/locales/ru.json b/frontend/src/locales/ru.json
+index 1421a22..1212e54 100644
+--- a/frontend/src/locales/ru.json
++++ b/frontend/src/locales/ru.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "Введите код проверки с вашего доверенного устройства.",
+       "signIn": "Войти",
++      "preparingAssets": "Подготовка компонентов подписи {{percent}}%",
++      "preparingSigner": "Инициализация подписи, это занимает около минуты…",
++      "signingRequest": "Подписывание запроса…",
++      "signerFailed": "Не удалось подготовить подпись: {{error}}",
+       "verify": "Проверить",
+       "cancel": "Отмена",
+       "authFailed": "Ошибка аутентификации",
+@@ -131,6 +135,7 @@
+       "code": "Код 2FA",
+       "verify": "Проверить",
+       "reauth": "Обновить сессию",
++      "noPassword": "Эта учётная запись импортирована как набор токенов и не содержит пароля для входа. Удалите её и добавьте заново с почтой и паролем.",
+       "delete": "Удалить аккаунт",
+       "confirmDelete": "Подтвердить удаление",
+       "cancel": "Отмена",
+@@ -440,7 +445,7 @@
+     "purchase": {
+       "paidNotSupported": "Покупка платных приложений не поддерживается",
+       "unavailable": "Элемент временно недоступен",
+-      "passwordExpired": "Токен пароля истек",
++      "passwordExpired": "Срок действия токена пароля истёк",
+       "subscriptionRequired": "Требуется подписка",
+       "termsRequired": "Вы должны принять Условия и положения: {{url}}",
+       "failed": "Ошибка покупки: {{failureType}}",
+diff --git a/frontend/src/locales/zh-CN.json b/frontend/src/locales/zh-CN.json
+index bd8f884..d6c3082 100644
+--- a/frontend/src/locales/zh-CN.json
++++ b/frontend/src/locales/zh-CN.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "输入来自您受信任设备的验证码。",
+       "signIn": "登录",
++      "preparingAssets": "正在准备签名组件 {{percent}}%",
++      "preparingSigner": "正在初始化签名器，约需一分钟…",
++      "signingRequest": "正在签名请求…",
++      "signerFailed": "签名组件准备失败：{{error}}",
+       "verify": "验证",
+       "cancel": "取消",
+       "authFailed": "认证失败",
+@@ -131,6 +135,7 @@
+       "code": "双重认证代码",
+       "verify": "验证",
+       "reauth": "重新认证",
++      "noPassword": "该账号是以令牌方式导入的，没有密码可用于登录。请删除后用邮箱和密码重新添加。",
+       "delete": "删除账号",
+       "confirmDelete": "确认删除",
+       "cancel": "取消",
+diff --git a/frontend/src/locales/zh-TW.json b/frontend/src/locales/zh-TW.json
+index fb64a3c..7227fe6 100644
+--- a/frontend/src/locales/zh-TW.json
++++ b/frontend/src/locales/zh-TW.json
+@@ -110,6 +110,10 @@
+       "codePlaceholder": "000000",
+       "codeHelp": "輸入來自您受信任裝置的驗證碼。",
+       "signIn": "登入",
++      "preparingAssets": "正在準備簽名元件 {{percent}}%",
++      "preparingSigner": "正在初始化簽名器，約需一分鐘…",
++      "signingRequest": "正在簽署請求…",
++      "signerFailed": "簽名元件準備失敗：{{error}}",
+       "verify": "驗證",
+       "cancel": "取消",
+       "authFailed": "認證失敗",
+@@ -131,6 +135,7 @@
+       "code": "雙重認證代碼",
+       "verify": "驗證",
+       "reauth": "重新認證",
++      "noPassword": "該帳號是以權杖方式匯入的，沒有密碼可用於登入。請刪除後用電子郵件和密碼重新新增。",
+       "delete": "刪除帳號",
+       "confirmDelete": "確認刪除",
+       "cancel": "取消",
+diff --git a/frontend/src/store/sap.ts b/frontend/src/store/sap.ts
+new file mode 100644
+index 0000000..bbc3384
+--- /dev/null
++++ b/frontend/src/store/sap.ts
+@@ -0,0 +1,54 @@
++import { create } from "zustand";
++
++// Readiness of the SAP signer, shared so any screen can show what it is doing.
++//
++// Preparing it takes a minute or two — 38 MB of Apple binaries and ten million
++// emulated instructions — so it starts on its own in the background as soon as
++// there is an account to prepare it for. A button pressed while that is under
++// way shows the progress already being made instead of starting over in
++// silence.
++
++export type SapStage = "idle" | "assets" | "setup" | "ready" | "error";
++
++interface SapStore {
++  stage: SapStage;
++  /** 0 to 100 while assets download, null once past that. */
++  percent: number | null;
++  error: string | null;
++  /** The hardware id the signer was prepared for. */
++  hardwareID: string | null;
++
++  begin: (hardwareID: string) => void;
++  setAssets: (percent: number) => void;
++  setSetup: () => void;
++  setReady: () => void;
++  setError: (message: string) => void;
++}
++
++export const useSapStore = create<SapStore>((set) => ({
++  stage: "idle",
++  percent: null,
++  error: null,
++  hardwareID: null,
++
++  begin: (hardwareID) =>
++    set({ stage: "assets", percent: 0, error: null, hardwareID }),
++  setAssets: (percent) => set({ stage: "assets", percent }),
++  setSetup: () => set({ stage: "setup", percent: null }),
++  setReady: () => set({ stage: "ready", percent: null, error: null }),
++  setError: (message) => set({ stage: "error", percent: null, error: message }),
++}));
++
++/** A human-readable line for the current stage, or null when there is nothing to say. */
++export function sapStatusKey(stage: SapStage): string | null {
++  switch (stage) {
++    case "assets":
++      return "accounts.addForm.preparingAssets";
++    case "setup":
++      return "accounts.addForm.preparingSigner";
++    case "error":
++      return "accounts.addForm.signerFailed";
++    default:
++      return null;
++  }
++}
+-- 
+2.39.5
+

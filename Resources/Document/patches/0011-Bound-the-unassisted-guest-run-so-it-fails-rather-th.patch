@@ -1,0 +1,176 @@
+From 8245d6fa14ba62f859c1f1ed690eb37880cf72cd Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 12:39:16 +0000
+Subject: [PATCH] Bound the unassisted guest run so it fails rather than hangs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A report came back with exchange.1 running for 654 seconds on a phone whose
+measured guest speed is about twenty thousand instructions a second. On the
+same device machine.initialize took 72.9s against roughly 60s on a desktop, so
+the phone is about 1.2x slower — and a desktop finishes the entire setup in
+115s. exchange.1 should have taken thirty to forty seconds. 654 is twenty times
+that.
+
+The cause is in Machine.run(). When measure() cannot read a block — the memory
+is unreadable, or the decoder does not know the instruction — the whole
+remaining budget goes to a single emu_start:
+
+    if (!block) {
+      this.segment(address, budget, null);   // budget is still 100_000_000
+      budget = 0;
+    }
+
+At twenty thousand instructions a second that is about eighty minutes inside
+one synchronous call, against a 15 minute client timeout, and silent for all of
+it, because nothing can report from inside a running emulator.
+
+The path is now capped at 2_000_000 instructions and throws an error naming the
+address when it is exceeded — about a hundred seconds on that phone instead of
+a silent eighty minutes. No path that completes today is lost by the cap: a
+guest needing more than this unassisted already could not finish inside the
+timeout.
+
+What this does not establish: whether that device actually takes this branch.
+Nothing can be reported from inside the emulator, so it cannot be confirmed
+from outside. The cap turns the question into one that answers itself — the
+next report either carries the new error, which confirms it, or the setup
+completes, which means the suspicion was wrong and nothing was lost either way.
+
+unassistedAllowance carries four unit tests. The part of run() that drives the
+emulator is not tested here; this environment has no real 38 MB binaries.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/sap/machine.ts          | 48 ++++++++++++++++++++--
+ frontend/tests/apple/machineBudget.test.ts | 44 ++++++++++++++++++++
+ 2 files changed, 88 insertions(+), 4 deletions(-)
+ create mode 100644 frontend/tests/apple/machineBudget.test.ts
+
+diff --git a/frontend/src/apple/sap/machine.ts b/frontend/src/apple/sap/machine.ts
+index cafc7e7..9041eb3 100644
+--- a/frontend/src/apple/sap/machine.ts
++++ b/frontend/src/apple/sap/machine.ts
+@@ -46,6 +46,35 @@ const MAX_BLOCK_INSTRUCTIONS = 32;
+ // Enough bytes to decode MAX_BLOCK_INSTRUCTIONS of any encoding.
+ const CODE_WINDOW = MAX_BLOCK_INSTRUCTIONS * 15;
+ 
++// How many instructions a block the decoder cannot read may run unassisted.
++//
++// The whole remaining budget used to be handed to one emu_start in that case.
++// Measured on an 8 GB Android phone, the guest runs at roughly twenty thousand
++// instructions a second, so a full 100M budget is an hour and a half inside a
++// single call — long past the client's 15 minute timeout, and silent for all of
++// it, because nothing can report from inside a running emulator. Capping it
++// turns that into an error naming the cause in about two minutes.
++//
++// Nothing that completes today is lost by the cap: a run needing more than
++// this unassisted already could not finish inside the timeout.
++const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
++
++/**
++ * How many instructions an unassisted run may take, and why it stops there.
++ *
++ * Split out from run() because run() drives the emulator and cannot be unit
++ * tested here, while the arithmetic that decides whether a guest is allowed to
++ * continue can be.
++ */
++export function unassistedAllowance(
++  remaining: number,
++  alreadyRun: number,
++): { allowed: number; exhausted: boolean } {
++  const room = UNASSISTED_INSTRUCTION_LIMIT - alreadyRun;
++  if (room <= 0) return { allowed: 0, exhausted: true };
++  return { allowed: Math.min(room, remaining), exhausted: false };
++}
++
+ const CORE_EXPORT_NAMES = [
+   "_WIn9UJ86JKdV4dM",
+   "_X46O5IeS",
+@@ -85,6 +114,8 @@ export class Machine {
+ 
+   private scratchCursor = 0n;
+   private closed = false;
++  /** Instructions run without the block splitter's help. See run(). */
++  private unassisted = 0;
+ 
+   private constructor(engine: Engine, shims: Shims, entry: EntryPoints) {
+     this.engine = engine;
+@@ -370,10 +401,19 @@ export class Machine {
+       const block = this.measure(address);
+ 
+       if (!block) {
+-        // Undecodable: let the emulator run unassisted, which is no worse
+-        // than not splitting at all.
+-        this.segment(address, budget, null);
+-        budget = 0;
++        // Undecodable: let the emulator run unassisted, but only up to a bound.
++        // An unbounded run here is both silent and longer than the caller's
++        // timeout, so it presents as a hang with nothing to report.
++        const allowance = unassistedAllowance(budget, this.unassisted);
++        if (allowance.exhausted) {
++          throw new Error(
++            `SAP guest needed more than ${UNASSISTED_INSTRUCTION_LIMIT} unassisted instructions at 0x${address.toString(16)}`,
++          );
++        }
++
++        this.unassisted += allowance.allowed;
++        this.segment(address, allowance.allowed, null);
++        budget -= allowance.allowed;
+       } else if (!block.complete) {
+         // Too long to translate whole. Stop it at the last safe boundary and
+         // resume from there; the guest cannot tell, only the translator can.
+diff --git a/frontend/tests/apple/machineBudget.test.ts b/frontend/tests/apple/machineBudget.test.ts
+new file mode 100644
+index 0000000..cf5dfba
+--- /dev/null
++++ b/frontend/tests/apple/machineBudget.test.ts
+@@ -0,0 +1,44 @@
++import { describe, it, expect } from "vitest";
++import { unassistedAllowance } from "../../src/apple/sap/machine";
++
++// A diagnostic report arrived with exchange.1 running for 654 seconds on a
++// phone whose measured guest speed is about twenty thousand instructions a
++// second. The cause was a block the decoder could not read handing the whole
++// 100M budget to one emu_start — roughly eighty minutes inside a single call,
++// against a 15 minute client timeout, and silent throughout because nothing
++// can report from inside a running emulator.
++
++const LIMIT = 2_000_000;
++
++describe("unassistedAllowance", () => {
++  it("lets a first undecodable block run, bounded by the cap rather than the budget", () => {
++    // The budget starts at 100M. Without the cap that whole figure went to one
++    // emu_start.
++    expect(unassistedAllowance(100_000_000, 0)).toEqual({
++      allowed: LIMIT,
++      exhausted: false,
++    });
++  });
++
++  it("never grants more than the caller's remaining budget", () => {
++    expect(unassistedAllowance(500, 0)).toEqual({ allowed: 500, exhausted: false });
++  });
++
++  it("refuses once the cap is used up, so the guest fails instead of hanging", () => {
++    expect(unassistedAllowance(100_000_000, LIMIT)).toEqual({
++      allowed: 0,
++      exhausted: true,
++    });
++    expect(unassistedAllowance(100_000_000, LIMIT + 1)).toEqual({
++      allowed: 0,
++      exhausted: true,
++    });
++  });
++
++  it("grants only what is left of the cap across repeated blocks", () => {
++    expect(unassistedAllowance(100_000_000, LIMIT - 1000)).toEqual({
++      allowed: 1000,
++      exhausted: false,
++    });
++  });
++});
+-- 
+2.39.5
+

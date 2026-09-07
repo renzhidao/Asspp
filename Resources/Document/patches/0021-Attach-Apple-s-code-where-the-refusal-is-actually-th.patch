@@ -1,0 +1,132 @@
+From 2d8df69db87e2efcab270973552d43cc60039d5a Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 16:54:05 +0000
+Subject: [PATCH] Attach Apple's code where the refusal is actually thrown
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous patch put the numeric failureType on the empty-songList branch and
+on purchase.ts. Deployed and retried, the error still read "App Not Available"
+with no code — because neither of those throws it.
+
+The volumeStore endpoint answers with its own failureType and customerMessage,
+and download.ts's default branch throws the words and returns before the
+songList check ever runs. That is the line the user has been reading.
+
+The code goes on that line now, so the next report says which rule refused.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts        | 17 +++++--
+ frontend/tests/apple/download.test.ts | 69 +++++++++++++++++++++++++++
+ 2 files changed, 83 insertions(+), 3 deletions(-)
+ create mode 100644 frontend/tests/apple/download.test.ts
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index b0a2a99..de156a4 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -111,10 +111,21 @@ export async function getDownloadInfo(
+               failureType,
+             );
+           }
+-          // If apple provides a specific string, we fall back to it, otherwise we use the localized default.
+-          throw new DownloadError(
+-            customerMessage ??
++          // If apple provides a specific string, we fall back to it, otherwise
++          // we use the localized default.
++          if (!customerMessage) {
++            throw new DownloadError(
+               i18n.t("errors.download.downloadFailed", { failureType }),
++              failureType,
++            );
++          }
++          // Apple's words go out, and so does its code. "App Not Available" is
++          // what the volumeStore endpoint answers for apps that are live and
++          // free in the account's storefront, so on its own it identifies
++          // nothing — and this branch throws before the empty-songList check
++          // below ever runs, which is where the code used to be attached.
++          throw new DownloadError(
++            `${customerMessage} (${failureType})`,
+             failureType,
+           );
+         }
+diff --git a/frontend/tests/apple/download.test.ts b/frontend/tests/apple/download.test.ts
+new file mode 100644
+index 0000000..4eee849
+--- /dev/null
++++ b/frontend/tests/apple/download.test.ts
+@@ -0,0 +1,69 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++
++// The report said "App Not Available" with no code. This is the branch that
++// threw it: the volumeStore endpoint answers with a failureType and a
++// customerMessage, and the customerMessage branch returns before the
++// empty-songList check that the code had been attached to.
++
++const appleRequest = vi.hoisted(() => vi.fn());
++
++vi.mock("../../src/apple/request", () => ({ appleRequest }));
++vi.mock("../../src/i18n", () => ({
++  default: {
++    t: (key: string, opts?: Record<string, unknown>) =>
++      opts ? `${key}:${JSON.stringify(opts)}` : key,
++  },
++}));
++
++const { getDownloadInfo, DownloadError } = await import("../../src/apple/download");
++
++const account = {
++  email: "a@example.com",
++  directoryServicesIdentifier: "d",
++  store: "143465",
++  cookies: [],
++  deviceIdentifier: "8a85f3e21c9d",
++} as never;
++
++const app = { id: "1468454200", name: "番茄小说" } as never;
++
++function respond(fields: Record<string, string>) {
++  const body = Object.entries(fields)
++    .map(([key, value]) => `    <key>${key}</key>\n    <string>${value}</string>`)
++    .join("\n");
++  appleRequest.mockResolvedValue({
++    status: 200,
++    body: `<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0">\n  <dict>\n${body}\n  </dict>\n</plist>`,
++    headers: {},
++    rawHeaders: [],
++  });
++}
++
++describe("the volumeStore refusal", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("carries Apple's code, not just its words", async () => {
++    respond({
++      failureType: "9008",
++      customerMessage: "App Not Available",
++    });
++
++    const error = await getDownloadInfo(account, app).catch((e) => e);
++
++    expect(error).toBeInstanceOf(DownloadError);
++    expect(error.message).toContain("App Not Available");
++    // Without the code every refusal reads the same, and the apps that fail
++    // here are live and free in this storefront, so the words identify nothing.
++    expect(error.message).toContain("9008");
++    expect(error.code).toBe("9008");
++  });
++
++  it("still localises when Apple sends no words", async () => {
++    respond({ failureType: "9008" });
++
++    const error = await getDownloadInfo(account, app).catch((e) => e);
++
++    expect(error.message).toContain("errors.download.downloadFailed");
++    expect(error.code).toBe("9008");
++  });
++});
+-- 
+2.39.5
+

@@ -1,0 +1,975 @@
+From 5c54fb8b0e14a7497543286f27deb54806ff47f7 Mon Sep 17 00:00:00 2001
+From: Tardisyuan <richard56500620@126.com>
+Date: Tue, 1 Sep 2026 20:34:30 +1000
+Subject: [PATCH 1/5] Fetch and serve the Apple binaries the SAP signer needs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The browser-side signer runs four binaries from a 2013 OS X release under
+emulation. They carry no credentials and are identical for everyone, so they
+are plain static files — but they are 38 MB and they are Apple's, so they stay
+out of the image and out of git.
+
+The backend fetches them from Apple's software update CDN the first time the
+signer asks and keeps them in DATA_DIR/sap, so a fresh deployment needs
+nothing done to it by hand. They live inside a xar container holding a
+bzip2-compressed cpio archive; reading it the way ipatool does — locate
+Payload in the table of contents, range-request from where its bzip2 stream
+resumes, put the header back in front, skip to the cpio, stop once the four
+are out — costs a fraction of the package.
+
+Assets are verified by SHA-256 rather than size. A file of the right length
+but wrong contents loads fine and then fails deep inside the emulator with
+nothing pointing back at the download. Verdicts are cached until a file's size
+or mtime changes, so the status endpoint stays cheap to poll, and a corrupt
+file is replaced rather than skipped.
+
+Also proxies the two setup endpoints. Neither carries credentials — the only
+identity in the handshake is the device's hardware id, the guid already sent
+in the clear — so this is the same kind of proxy as /api/bag and leaves intact
+the guarantee that the server never sees Apple credentials.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ backend/package-lock.json             |  61 +++++
+ backend/package.json                  |   1 +
+ backend/src/index.ts                  |   2 +
+ backend/src/routes/sap.ts             | 194 ++++++++++++++
+ backend/src/services/sapAssets.ts     | 348 ++++++++++++++++++++++++++
+ backend/src/types/unbzip2-stream.d.ts |   5 +
+ tools/fetch-sap-assets.mjs            | 124 +++++++++
+ tools/webkit-check.mjs                |  90 +++++++
+ 8 files changed, 825 insertions(+)
+ create mode 100644 backend/src/routes/sap.ts
+ create mode 100644 backend/src/services/sapAssets.ts
+ create mode 100644 backend/src/types/unbzip2-stream.d.ts
+ create mode 100644 tools/fetch-sap-assets.mjs
+ create mode 100644 tools/webkit-check.mjs
+
+diff --git a/backend/package-lock.json b/backend/package-lock.json
+index 2b1948b..efbfb82 100644
+--- a/backend/package-lock.json
++++ b/backend/package-lock.json
+@@ -14,6 +14,7 @@
+         "bplist-parser": "^0.3.2",
+         "express": "^4.21.2",
+         "plist": "^3.1.0",
++        "unbzip2-stream": "^1.4.3",
+         "uuid": "^11.0.5",
+         "yauzl-promise": "^4.0.0"
+       },
+@@ -2040,6 +2041,30 @@
+         "node": ">= 5.10.0"
+       }
+     },
++    "node_modules/buffer": {
++      "version": "5.7.1",
++      "resolved": "https://registry.npmjs.org/buffer/-/buffer-5.7.1.tgz",
++      "integrity": "sha512-EHcyIPBQ4BSGlvjB16k5KgAJ27CIsHY/2JBmCRReo48y9rQ3MaUzWX3KVlBa4U7MyX02HdVj0K7C3WaB3ju7FQ==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "MIT",
++      "dependencies": {
++        "base64-js": "^1.3.1",
++        "ieee754": "^1.1.13"
++      }
++    },
+     "node_modules/bufferutil": {
+       "version": "4.1.0",
+       "resolved": "https://registry.npmjs.org/bufferutil/-/bufferutil-4.1.0.tgz",
+@@ -2936,6 +2961,26 @@
+         "node": ">=0.10.0"
+       }
+     },
++    "node_modules/ieee754": {
++      "version": "1.2.1",
++      "resolved": "https://registry.npmjs.org/ieee754/-/ieee754-1.2.1.tgz",
++      "integrity": "sha512-dcyqhDvX1C46lXZcVqCpK+FtMRQVdIMN6/Df5js2zouUsqG7I6sFxitIC+7KYK29KdXOLHdu9zL4sFnoVQnqaA==",
++      "funding": [
++        {
++          "type": "github",
++          "url": "https://github.com/sponsors/feross"
++        },
++        {
++          "type": "patreon",
++          "url": "https://www.patreon.com/feross"
++        },
++        {
++          "type": "consulting",
++          "url": "https://feross.org/support"
++        }
++      ],
++      "license": "BSD-3-Clause"
++    },
+     "node_modules/indent-string": {
+       "version": "4.0.0",
+       "resolved": "https://registry.npmjs.org/indent-string/-/indent-string-4.0.0.tgz",
+@@ -3864,6 +3909,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/through": {
++      "version": "2.3.8",
++      "resolved": "https://registry.npmjs.org/through/-/through-2.3.8.tgz",
++      "integrity": "sha512-w89qg7PI8wAdvX60bMDP+bFoD5Dvhm9oLheFp5O4a2QF0cSBGsBX4qZmadPMvVqlLJBBci+WqGGOAPvcDeNSVg==",
++      "license": "MIT"
++    },
+     "node_modules/tinybench": {
+       "version": "2.9.0",
+       "resolved": "https://registry.npmjs.org/tinybench/-/tinybench-2.9.0.tgz",
+@@ -4017,6 +4068,16 @@
+         "node": ">=14.17"
+       }
+     },
++    "node_modules/unbzip2-stream": {
++      "version": "1.4.3",
++      "resolved": "https://registry.npmjs.org/unbzip2-stream/-/unbzip2-stream-1.4.3.tgz",
++      "integrity": "sha512-mlExGW4w71ebDJviH16lQLtZS32VKqsSfk80GCfUlwT/4/hNRFsoscrF/c++9xinkMzECL1uL9DDwXqFWkruPg==",
++      "license": "MIT",
++      "dependencies": {
++        "buffer": "^5.2.1",
++        "through": "^2.3.8"
++      }
++    },
+     "node_modules/undici": {
+       "version": "7.21.0",
+       "resolved": "https://registry.npmjs.org/undici/-/undici-7.21.0.tgz",
+diff --git a/backend/package.json b/backend/package.json
+index 1686166..ce99bc3 100644
+--- a/backend/package.json
++++ b/backend/package.json
+@@ -17,6 +17,7 @@
+     "bplist-parser": "^0.3.2",
+     "express": "^4.21.2",
+     "plist": "^3.1.0",
++    "unbzip2-stream": "^1.4.3",
+     "uuid": "^11.0.5",
+     "yauzl-promise": "^4.0.0"
+   },
+diff --git a/backend/src/index.ts b/backend/src/index.ts
+index 7151d94..a533d39 100644
+--- a/backend/src/index.ts
++++ b/backend/src/index.ts
+@@ -14,6 +14,7 @@ import packageRoutes from "./routes/packages.js";
+ import installRoutes from "./routes/install.js";
+ import settingsRoutes from "./routes/settings.js";
+ import bagRoutes from "./routes/bag.js";
++import sapRoutes from "./routes/sap.js";
+ 
+ const app = express();
+ 
+@@ -30,6 +31,7 @@ app.use("/api", packageRoutes);
+ app.use("/api", installRoutes);
+ app.use("/api", settingsRoutes);
+ app.use("/api", bagRoutes);
++app.use("/api", sapRoutes);
+ 
+ // Serve static frontend files
+ const publicDir = path.resolve(import.meta.dirname, "../public");
+diff --git a/backend/src/routes/sap.ts b/backend/src/routes/sap.ts
+new file mode 100644
+index 0000000..53eaf8e
+--- /dev/null
++++ b/backend/src/routes/sap.ts
+@@ -0,0 +1,194 @@
++import express, { Router, Request, Response } from "express";
++import { createReadStream } from "fs";
++import path from "path";
++import {
++  REQUIRED_ASSETS,
++  assetDirectory,
++  fetchAssets,
++  verifyAsset,
++  verifyAssets,
++  type FetchProgress,
++} from "../services/sapAssets.js";
++
++const userAgent =
++  "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
++
++// Serves the four Apple binaries the browser-side SAP signer runs under
++// emulation. They are public components of a 2013 OS X release, carry no
++// credentials, and are identical for every user, so they are plain static
++// files rather than anything per-account.
++//
++// They are not in the image: they are large, they belong to Apple, and the
++// signer only needs them when someone signs in. Populate DATA_DIR/sap with
++// tools/fetch-sap-assets.mjs.
++
++const router = Router();
++
++// One download at a time, with its state readable while it runs, so a second
++// caller watches rather than starting a duplicate.
++let fetching: Promise<string[]> | null = null;
++let progress: FetchProgress | null = null;
++let lastError: string | null = null;
++
++router.post("/sap/assets/fetch", (_req: Request, res: Response) => {
++  if (!fetching) {
++    lastError = null;
++    progress = { stage: "locating", found: [] };
++
++    console.log("SAP assets: fetching from Apple");
++    fetching = fetchAssets((update) => {
++      progress = update;
++      console.log(
++        `SAP assets: ${update.stage}` +
++          (update.found.length ? ` (${update.found.join(", ")})` : ""),
++      );
++    })
++      .catch((error) => {
++        lastError = error instanceof Error ? error.message : String(error);
++        console.error("SAP assets: fetch failed:", lastError);
++        throw error;
++      })
++      .finally(() => {
++        fetching = null;
++      });
++
++    // Answered immediately; the caller polls GET for how it is going.
++    fetching.catch(() => {});
++  }
++
++  res.status(202).json({ started: true, progress });
++});
++
++router.get("/sap/assets", async (_req: Request, res: Response) => {
++  // Digests, not sizes: a file of the right length but wrong contents loads
++  // and then fails deep inside the emulator with nothing pointing back here.
++  // Verdicts are cached until a file changes, so this is cheap to poll.
++  const { ok, missing, corrupt } = await verifyAssets();
++
++  res.json({
++    available: ok,
++    missing: [...missing, ...corrupt],
++    corrupt,
++    ready: missing.length === 0 && corrupt.length === 0,
++    fetching: fetching !== null,
++    progress,
++    error: lastError,
++  });
++});
++
++router.get("/sap/assets/:name", async (req: Request, res: Response) => {
++  // Express 5 types a route parameter as string | string[]; the lookup below
++  // is what makes it safe either way.
++  const name = String(req.params.name ?? "");
++  const spec = REQUIRED_ASSETS.find((asset) => asset.name === name);
++
++  // Only the four known names, so the parameter can never walk the filesystem.
++  if (!spec) {
++    res.status(404).json({ error: "Unknown SAP asset" });
++    return;
++  }
++
++  const state = await verifyAsset(spec);
++
++  if (state === "missing") {
++    res.status(503).json({
++      error: `SAP asset ${name} is not installed`,
++      hint: "POST /api/sap/assets/fetch to download it from Apple",
++    });
++    return;
++  }
++
++  if (state === "corrupt") {
++    res.status(500).json({
++      error: `SAP asset ${name} does not match its digest`,
++      hint: "POST /api/sap/assets/fetch to replace it",
++    });
++    return;
++  }
++
++  const file = path.join(assetDirectory(), name);
++  console.log(`SAP assets: serving ${name} (${spec.size} bytes)`);
++  res.type("application/octet-stream");
++  res.setHeader("Content-Length", String(spec.size));
++  // Immutable: these are fixed files from a 2013 release.
++  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
++  createReadStream(file).pipe(res);
++});
++
++// The two SAP setup endpoints, proxied.
++//
++// Setting up a signer takes one fetch of Apple's certificate and one exchange
++// of an opaque buffer. Neither carries credentials — the only identity in the
++// handshake is the device's hardware id, which is the guid the client already
++// sends in the clear — so this is the same kind of proxy as /api/bag and does
++// not weaken the guarantee that the server never sees Apple credentials.
++//
++// Proxied rather than tunnelled because the signer runs in a Web Worker,
++// where standing up a second Wisp client would buy nothing: there is no
++// secret here to keep from the server.
++
++const SETUP_HOSTS: Record<string, string> = {
++  certificate: "https://s.mzstatic.com/sap/setupCert.plist",
++  setup: "https://fpinit.itunes.apple.com/v1/signSapSetup/legacy",
++};
++
++const SAP_TIMEOUT_MS = 30_000;
++const SAP_MAX_BYTES = 1 << 20;
++
++async function relay(
++  target: string,
++  init: RequestInit,
++  res: Response,
++): Promise<void> {
++  const controller = new AbortController();
++  const timer = setTimeout(() => controller.abort(), SAP_TIMEOUT_MS);
++
++  try {
++    const upstream = await fetch(target, { ...init, signal: controller.signal });
++    const body = Buffer.from(await upstream.arrayBuffer());
++
++    if (body.length > SAP_MAX_BYTES) {
++      res.status(502).json({ error: "SAP response is too large" });
++      return;
++    }
++
++    if (!upstream.ok) {
++      res.status(502).json({ error: `Apple returned ${upstream.status}` });
++      return;
++    }
++
++    res.type("application/x-plist").send(body);
++  } catch (error) {
++    console.error("SAP proxy error:", error instanceof Error ? error.message : error);
++    res.status(502).json({ error: "SAP request failed" });
++  } finally {
++    clearTimeout(timer);
++  }
++}
++
++router.get("/sap/certificate", async (_req: Request, res: Response) => {
++  console.log("SAP setup: fetching Apple's certificate");
++  await relay(SETUP_HOSTS.certificate, {
++    headers: { "User-Agent": userAgent, Accept: "application/x-plist" },
++  }, res);
++});
++
++router.post(
++  "/sap/setup",
++  express.raw({ type: "*/*", limit: "1mb" }),
++  async (req: Request, res: Response) => {
++    if (!Buffer.isBuffer(req.body) || req.body.length === 0) {
++      res.status(400).json({ error: "Missing SAP setup buffer" });
++      return;
++    }
++
++    console.log(`SAP setup: exchanging ${req.body.length} bytes with Apple`);
++    await relay(SETUP_HOSTS.setup, {
++      method: "POST",
++      headers: { "User-Agent": userAgent, "Content-Type": "application/x-plist" },
++      body: new Uint8Array(req.body),
++    }, res);
++  },
++);
++
++export default router;
+diff --git a/backend/src/services/sapAssets.ts b/backend/src/services/sapAssets.ts
+new file mode 100644
+index 0000000..1a337f6
+--- /dev/null
++++ b/backend/src/services/sapAssets.ts
+@@ -0,0 +1,348 @@
++// Downloads the Apple binaries the browser-side SAP signer runs under
++// emulation, straight from Apple's software update CDN.
++//
++// They live inside a 2013 OS X update package: a xar container holding a
++// bzip2-compressed cpio archive. Only four files out of it are wanted and the
++// package is far larger than they are, so this reads it with range requests
++// and stops as soon as it has them, the way ipatool's internal/sap/assets
++// does.
++//
++// The result is written to DATA_DIR/sap and reused forever after — the files
++// come from a fixed release and never change. Each is checked against its
++// SHA-256 before being kept.
++
++import { createHash } from "crypto";
++import { mkdir, readFile, rename, stat, writeFile } from "fs/promises";
++import path from "path";
++import { Readable } from "stream";
++import { inflateSync } from "zlib";
++import unbzip2 from "unbzip2-stream";
++import { config } from "../config.js";
++
++const UPDATE_URL =
++  "https://swcdn.apple.com/content/downloads/27/34/041-98128-A_SYPWICN3KH/5dqkl4rqgbsr18yzy61yeie9g3cmjc5hiv/OSXUpd10.9.pkg";
++
++// Where the bzip2 stream resumes inside the payload, and how far past the
++// start of the decompressed data the cpio archive begins. Both are properties
++// of this particular package.
++const PAYLOAD_BZ_OFFSET = 0x352f40d5;
++const PAYLOAD_CPIO_SKIP = 0x3a4;
++
++const XAR_MAGIC = 0x78617221; // "xar!"
++
++interface AssetSpec {
++  name: string;
++  path: string;
++  size: number;
++  sha256: string;
++}
++
++export const REQUIRED_ASSETS: AssetSpec[] = [
++  {
++    name: "CommerceKit",
++    path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/CommerceKit",
++    size: 3271840,
++    sha256: "b84ff12c21987856c0a17b78f1ad82b73195a6dec5f3b208a17d245555a2c8a2",
++  },
++  {
++    name: "CommerceCore",
++    path: "./System/Library/PrivateFrameworks/CommerceKit.framework/Versions/A/Frameworks/CommerceCore.framework/Versions/A/CommerceCore",
++    size: 207744,
++    sha256: "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2",
++  },
++  {
++    name: "CoreFP",
++    path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP",
++    size: 29014912,
++    sha256: "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074",
++  },
++  {
++    name: "CoreFP.icxs",
++    path: "./System/Library/PrivateFrameworks/CoreFP.framework/Versions/A/CoreFP.icxs",
++    size: 5288352,
++    sha256: "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a",
++  },
++];
++
++export function assetDirectory(): string {
++  return path.join(config.dataDir, "sap");
++}
++
++export type AssetState = "ok" | "missing" | "corrupt";
++
++// Digesting 38 MB on every request would be wasteful, and these files never
++// change once written, so a verdict is kept until the file does. Size and
++// modification time are enough to notice a replacement.
++const verdicts = new Map<string, { size: number; mtimeMs: number; state: AssetState }>();
++
++/**
++ * Checks one asset against its recorded size and digest.
++ *
++ * The size alone is not enough: a file of the right length but wrong contents
++ * loads fine and then fails somewhere deep inside the emulator, with nothing
++ * to connect the fault back to a bad download.
++ */
++export async function verifyAsset(spec: AssetSpec): Promise<AssetState> {
++  const file = path.join(assetDirectory(), spec.name);
++
++  let info: Awaited<ReturnType<typeof stat>>;
++  try {
++    info = await stat(file);
++  } catch {
++    verdicts.delete(spec.name);
++    return "missing";
++  }
++
++  const cached = verdicts.get(spec.name);
++  if (cached && cached.size === info.size && cached.mtimeMs === info.mtimeMs) {
++    return cached.state;
++  }
++
++  let state: AssetState = "corrupt";
++  if (info.size === spec.size) {
++    const digest = createHash("sha256").update(await readFile(file)).digest("hex");
++    state = digest === spec.sha256 ? "ok" : "corrupt";
++  }
++
++  if (state === "corrupt") {
++    console.error(
++      `SAP assets: ${spec.name} is ${info.size} bytes and does not match its digest`,
++    );
++  }
++
++  verdicts.set(spec.name, { size: info.size, mtimeMs: info.mtimeMs, state });
++  return state;
++}
++
++/** Verifies every asset, reporting which are usable and which are not. */
++export async function verifyAssets(): Promise<{
++  ok: string[];
++  missing: string[];
++  corrupt: string[];
++}> {
++  const ok: string[] = [];
++  const missing: string[] = [];
++  const corrupt: string[] = [];
++
++  for (const spec of REQUIRED_ASSETS) {
++    const state = await verifyAsset(spec);
++    if (state === "ok") ok.push(spec.name);
++    else if (state === "missing") missing.push(spec.name);
++    else corrupt.push(spec.name);
++  }
++
++  return { ok, missing, corrupt };
++}
++
++async function range(start: number, end?: number): Promise<Response> {
++  const response = await fetch(UPDATE_URL, {
++    headers: { Range: `bytes=${start}-${end ?? ""}` },
++  });
++
++  if (response.status !== 206 && response.status !== 200) {
++    throw new Error(`Apple returned ${response.status} for the update package`);
++  }
++
++  return response;
++}
++
++/** Locates the Payload member inside the xar container. */
++async function locatePayload(): Promise<{ offset: number; length: number }> {
++  const head = Buffer.from(await (await range(0, 27)).arrayBuffer());
++  if (head.readUInt32BE(0) !== XAR_MAGIC) {
++    throw new Error("Apple update package is not a xar archive");
++  }
++
++  const headerSize = head.readUInt16BE(4);
++  const tocCompressed = Number(head.readBigUInt64BE(8));
++
++  const tocRaw = Buffer.from(
++    await (await range(headerSize, headerSize + tocCompressed - 1)).arrayBuffer(),
++  );
++  const toc = inflateSync(tocRaw).toString("utf8");
++
++  // The table of contents is XML; the Payload's entry carries the offset and
++  // length of its bytes within the heap that follows the contents.
++  const entry = /<file[^>]*>(?:(?!<\/file>)[\s\S])*?<name>Payload<\/name>[\s\S]*?<\/file>/.exec(toc);
++  if (!entry) throw new Error("Apple update package has no Payload member");
++
++  const offset = /<offset>(\d+)<\/offset>/.exec(entry[0]);
++  const length = /<length>(\d+)<\/length>/.exec(entry[0]);
++  if (!offset || !length) {
++    throw new Error("Apple update package Payload has no extent");
++  }
++
++  return {
++    offset: headerSize + tocCompressed + Number(offset[1]),
++    length: Number(length[1]),
++  };
++}
++
++/**
++ * Reads the old portable ASCII cpio format Apple's payload uses, handing each
++ * entry to `onEntry` and stopping as soon as it returns false.
++ */
++async function readCpio(
++  stream: AsyncIterable<Buffer>,
++  onEntry: (name: string, body: Buffer) => boolean,
++): Promise<void> {
++  const HEADER = 76;
++  let buffer = Buffer.alloc(0);
++  let done = false;
++
++  for await (const chunk of stream) {
++    if (done) break;
++    buffer = Buffer.concat([buffer, chunk]);
++
++    for (;;) {
++      if (buffer.length < HEADER) break;
++      if (buffer.subarray(0, 6).toString("ascii") !== "070707") {
++        throw new Error("Apple payload is not a portable ASCII cpio archive");
++      }
++
++      const nameSize = parseInt(buffer.subarray(59, 65).toString("ascii"), 8);
++      const fileSize = parseInt(buffer.subarray(65, 76).toString("ascii"), 8);
++      if (!Number.isFinite(nameSize) || !Number.isFinite(fileSize)) {
++        throw new Error("Apple payload has an unreadable cpio header");
++      }
++
++      const total = HEADER + nameSize + fileSize;
++      if (buffer.length < total) break;
++
++      const name = buffer.subarray(HEADER, HEADER + nameSize - 1).toString("ascii");
++      if (name === "TRAILER!!!") {
++        done = true;
++        break;
++      }
++
++      const body = buffer.subarray(HEADER + nameSize, total);
++      if (!onEntry(name, body)) {
++        done = true;
++        break;
++      }
++
++      buffer = buffer.subarray(total);
++    }
++  }
++}
++
++export interface FetchProgress {
++  stage: "locating" | "downloading" | "verifying" | "done";
++  found: string[];
++}
++
++/**
++ * Downloads and extracts the assets into DATA_DIR/sap. Files already present
++ * and the right size are left alone, so this is safe to call repeatedly.
++ */
++export async function fetchAssets(
++  onProgress?: (progress: FetchProgress) => void,
++): Promise<string[]> {
++  const target = assetDirectory();
++  await mkdir(target, { recursive: true });
++
++  // Anything already present and verified is left alone; a corrupt file is
++  // replaced rather than skipped, which is the whole point of checking the
++  // digest rather than the size.
++  const existing = await verifyAssets();
++  if (existing.ok.length === REQUIRED_ASSETS.length) {
++    onProgress?.({ stage: "done", found: existing.ok });
++    return existing.ok;
++  }
++
++  if (existing.corrupt.length) {
++    console.warn(`SAP assets: replacing corrupt ${existing.corrupt.join(", ")}`);
++  }
++
++  onProgress?.({ stage: "locating", found: [] });
++  const payload = await locatePayload();
++
++  onProgress?.({ stage: "downloading", found: [] });
++  const response = await range(
++    payload.offset + PAYLOAD_BZ_OFFSET,
++    payload.offset + payload.length - 1,
++  );
++  if (!response.body) throw new Error("Apple returned an empty payload stream");
++
++  // The range starts mid-stream at a block boundary, so the bzip2 header has
++  // to be put back in front of it.
++  const compressed = Readable.from(
++    (async function* () {
++      yield Buffer.from("BZh9", "ascii");
++      // eslint-disable-next-line @typescript-eslint/no-explicit-any
++      for await (const chunk of response.body as any) yield Buffer.from(chunk);
++    })(),
++  );
++
++  const wanted = new Map(REQUIRED_ASSETS.map((asset) => [asset.path, asset]));
++  const found: string[] = [];
++  const pending = new Map<string, Buffer>();
++
++  // unbzip2-stream is built on `through`, so it hands back an old-style
++  // stream that cannot be iterated; wrap turns it into one that can.
++  const decompressed = new Readable({ read() {} }).wrap(
++    compressed.pipe(unbzip2()),
++  );
++
++  let skipped = 0;
++  const archive = Readable.from(
++    (async function* () {
++      for await (const chunk of decompressed) {
++        let block = Buffer.from(chunk);
++        if (skipped < PAYLOAD_CPIO_SKIP) {
++          const drop = Math.min(PAYLOAD_CPIO_SKIP - skipped, block.length);
++          skipped += drop;
++          block = block.subarray(drop);
++          if (block.length === 0) continue;
++        }
++        yield block;
++      }
++    })(),
++  );
++
++  await readCpio(archive as AsyncIterable<Buffer>, (name, body) => {
++    const asset = wanted.get(name);
++    if (asset) {
++      pending.set(asset.name, Buffer.from(body));
++      found.push(asset.name);
++      onProgress?.({ stage: "downloading", found: [...found] });
++    }
++    return pending.size < wanted.size;
++  });
++
++  onProgress?.({ stage: "verifying", found: [...found] });
++
++  const written: string[] = [];
++  for (const asset of REQUIRED_ASSETS) {
++    const body = pending.get(asset.name);
++    if (!body) continue;
++
++    if (body.length !== asset.size) {
++      throw new Error(
++        `${asset.name} is ${body.length} bytes, expected ${asset.size}`,
++      );
++    }
++
++    const digest = createHash("sha256").update(body).digest("hex");
++    if (digest !== asset.sha256) {
++      throw new Error(`${asset.name} failed its digest check`);
++    }
++
++    // Written aside then renamed, so a partial file is never served.
++    const destination = path.join(target, asset.name);
++    const temporary = `${destination}.partial`;
++    await writeFile(temporary, body);
++    await rename(temporary, destination);
++    written.push(asset.name);
++  }
++
++  if (written.length !== REQUIRED_ASSETS.length) {
++    const missing = REQUIRED_ASSETS.filter(
++      (asset) => !written.includes(asset.name),
++    ).map((asset) => asset.name);
++    throw new Error(`Apple payload did not contain ${missing.join(", ")}`);
++  }
++
++  onProgress?.({ stage: "done", found: written });
++  return written;
++}
+diff --git a/backend/src/types/unbzip2-stream.d.ts b/backend/src/types/unbzip2-stream.d.ts
+new file mode 100644
+index 0000000..f1e9925
+--- /dev/null
++++ b/backend/src/types/unbzip2-stream.d.ts
+@@ -0,0 +1,5 @@
++// unbzip2-stream ships no types. It is a plain stream factory.
++declare module "unbzip2-stream" {
++  import { Transform } from "stream";
++  export default function unbzip2(): Transform;
++}
+diff --git a/tools/fetch-sap-assets.mjs b/tools/fetch-sap-assets.mjs
+new file mode 100644
+index 0000000..2d57d8f
+--- /dev/null
++++ b/tools/fetch-sap-assets.mjs
+@@ -0,0 +1,124 @@
++#!/usr/bin/env node
++// Populates DATA_DIR/sap with the four Apple binaries the browser-side SAP
++// signer runs under emulation.
++//
++// The backend fetches these from Apple on its own the first time the signer
++// asks for them, so this script is only a shortcut: if ipatool has already
++// cached them on this machine, copying is faster than downloading 38 MB out
++// of a 2013 update package again.
++//
++// The files carry no credentials and are identical for everyone; they are
++// kept out of the image because they are large and belong to Apple.
++//
++//   node tools/fetch-sap-assets.mjs [--data-dir ./mnt/asspp-data]
++
++import { copyFile, mkdir, stat } from "node:fs/promises";
++import { createHash } from "node:crypto";
++import { readFile } from "node:fs/promises";
++import { homedir, platform } from "node:os";
++import { join } from "node:path";
++
++const ASSETS = [
++  {
++    name: "CommerceKit",
++    size: 3271840,
++    sha256: "b84ff12c21987856c0a17b78f1ad82b73195a6dec5f3b208a17d245555a2c8a2",
++  },
++  {
++    name: "CommerceCore",
++    size: 207744,
++    sha256: "c5401e57402230f3c876409d295319ddf1e61287bc882683c5d61277be7bc1f2",
++  },
++  {
++    name: "CoreFP",
++    size: 29014912,
++    sha256: "f19141336be4198d0f8991bb00017c915efc7aeaece36c345f7faa1237ea6074",
++  },
++  {
++    name: "CoreFP.icxs",
++    size: 5288352,
++    sha256: "473e78af86979f5bd4f6269561caf770b3d16c098d918846eeac8cdd2fe6566a",
++  },
++];
++
++/** Where ipatool caches them, per os.UserCacheDir on each platform. */
++function ipatoolCache() {
++  const relative = join("ipatool", "sap", "apple-assets-v2");
++
++  if (platform() === "darwin") {
++    return join(homedir(), "Library", "Caches", relative);
++  }
++  if (platform() === "win32") {
++    return join(process.env.LOCALAPPDATA ?? join(homedir(), "AppData", "Local"), relative);
++  }
++  return join(process.env.XDG_CACHE_HOME ?? join(homedir(), ".cache"), relative);
++}
++
++async function digest(file) {
++  return createHash("sha256").update(await readFile(file)).digest("hex");
++}
++
++async function main() {
++  const flag = process.argv.indexOf("--data-dir");
++  const dataDir = flag === -1 ? process.env.DATA_DIR ?? "./mnt/asspp-data" : process.argv[flag + 1];
++  const target = join(dataDir, "sap");
++  const source = ipatoolCache();
++
++  await mkdir(target, { recursive: true });
++
++  let copied = 0;
++  let present = 0;
++  const missing = [];
++
++  for (const asset of ASSETS) {
++    const destination = join(target, asset.name);
++
++    try {
++      if ((await stat(destination)).size === asset.size) {
++        present++;
++        continue;
++      }
++    } catch {
++      // not there yet
++    }
++
++    const origin = join(source, asset.name);
++    try {
++      if ((await stat(origin)).size !== asset.size) throw new Error("wrong size");
++    } catch {
++      missing.push(asset.name);
++      continue;
++    }
++
++    const actual = await digest(origin);
++    if (actual !== asset.sha256) {
++      console.error(`${asset.name}: digest mismatch, refusing to copy`);
++      console.error(`  expected ${asset.sha256}`);
++      console.error(`  found    ${actual}`);
++      missing.push(asset.name);
++      continue;
++    }
++
++    await copyFile(origin, destination);
++    console.log(`copied ${asset.name} (${(asset.size / 1048576).toFixed(1)} MB)`);
++    copied++;
++  }
++
++  if (present) console.log(`${present} already present`);
++
++  if (missing.length === 0) {
++    console.log(`\nSAP assets ready in ${target}`);
++    return;
++  }
++
++  console.error(`\nmissing: ${missing.join(", ")}`);
++  console.error(`\nThey were not found in ${source}, which is fine — the`);
++  console.error("backend downloads them from Apple the first time the signer");
++  console.error("runs. This script only saves that download when ipatool has");
++  console.error("already cached them here.");
++}
++
++main().catch((error) => {
++  console.error(error instanceof Error ? error.message : error);
++  process.exitCode = 1;
++});
+diff --git a/tools/webkit-check.mjs b/tools/webkit-check.mjs
+new file mode 100644
+index 0000000..8c275d4
+--- /dev/null
++++ b/tools/webkit-check.mjs
+@@ -0,0 +1,90 @@
++// Runs the SAP signer in Playwright's WebKit — the engine Safari uses — to
++// find out whether it works there at all, and under an iPhone's viewport and
++// user agent.
++//
++// This does not answer the memory question: a desktop WebKit has far more
++// headroom than a phone. It answers the other half — whether WebAssembly,
++// dedicated workers, the Cache API and the rest behave the way the signer
++// needs them to on WebKit rather than on Chrome.
++//
++// Playwright is not a dependency of this project. ESM resolves imports from
++// this file's own directory rather than the working directory, so it has to
++// be installed at the repo root — installing it under frontend/ does not help
++// however the script is invoked. With the dev servers already up:
++//
++//   npm install --no-save playwright && npx playwright install webkit
++//   node tools/webkit-check.mjs
++
++import { webkit, devices } from "playwright";
++
++const TARGET = process.env.TARGET ?? "http://localhost:5173/";
++const BUDGET_MS = 6 * 60 * 1000;
++
++const browser = await webkit.launch();
++const context = await browser.newContext(devices["iPhone 15"]);
++const page = await context.newPage();
++
++const consoleErrors = [];
++page.on("console", (message) => {
++  if (message.type() === "error") consoleErrors.push(message.text());
++});
++page.on("pageerror", (error) => consoleErrors.push(String(error.message)));
++
++console.log(`WebKit ${browser.version()}, iPhone 15 profile`);
++console.log(`opening ${TARGET}`);
++await page.goto(TARGET, { waitUntil: "domcontentloaded" });
++
++const result = await page.evaluate(async () => {
++  const marks = [];
++  const t0 = performance.now();
++  const at = () => Math.round(performance.now() - t0);
++
++  const capability = {
++    webassembly: typeof WebAssembly === "object",
++    worker: typeof Worker === "function",
++    caches: typeof caches === "object",
++    bigint: typeof BigInt === "function",
++  };
++
++  try {
++    const mod = await import("/src/apple/sap/client.ts");
++    let last = "";
++
++    await mod.prepareSigner("020000000000", (progress) => {
++      if (progress.phase !== last) {
++        last = progress.phase;
++        marks.push(`${progress.phase}@${at()}ms`);
++      }
++    });
++
++    const setupMs = at();
++    const s0 = performance.now();
++    const signature = await mod.signAction(new TextEncoder().encode("<plist/>"));
++
++    return {
++      ok: true,
++      capability,
++      marks,
++      setupMs,
++      signMs: Math.round(performance.now() - s0),
++      signatureBytes: signature.length,
++    };
++  } catch (error) {
++    return {
++      ok: false,
++      capability,
++      marks,
++      error: String((error && error.message) || error),
++    };
++  }
++}, { timeout: BUDGET_MS });
++
++console.log();
++console.log(JSON.stringify(result, null, 2));
++if (consoleErrors.length) {
++  console.log("\nconsole errors:");
++  for (const line of consoleErrors.slice(0, 8)) console.log(`  ${line}`);
++}
++
++await browser.close();
++process.exitCode = result.ok ? 0 : 1;
+-- 
+2.39.5
+

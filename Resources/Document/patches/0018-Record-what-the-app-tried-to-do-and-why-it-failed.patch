@@ -1,0 +1,409 @@
+From 20586f1d472039f4f604dc46fc8b472ec7120fa5 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 15:49:43 +0000
+Subject: [PATCH] Record what the app tried to do, and why it failed
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two reports came in from a failed download and neither said anything about the
+download. The diagnostics report only ever covered SAP setup — steps, assets,
+accounts — so a search, a licence and a download left no trace at all.
+
+There is now a bounded activity log, forty entries, oldest dropped first since
+whatever broke is recent. The report gains an [activity] section: when, what
+kind of action, which app, whether it worked, how long it took, and why not. No
+credential of any kind goes in it.
+
+noItems gets the same treatment. Apple answering without a failureType and
+without an item used to throw "no items in response" and discard the whole
+answer, so every one of those looked identical. It now carries Apple's own
+customerMessage, the storefront, and which keys the response did have — a
+storefront the app is not licensable in is the usual reason, and none of that
+was visible before.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts                | 17 ++++-
+ .../components/Settings/DiagnosticsModal.tsx  |  3 +
+ frontend/src/hooks/useDownloadAction.ts       | 49 +++++++++++++
+ frontend/src/store/activity.ts                | 41 +++++++++++
+ frontend/src/utils/diagnostics.ts             | 22 ++++++
+ .../tests/hooks/useDownloadAction.test.tsx    | 40 +++++++++++
+ frontend/tests/utils/activity.test.ts         | 72 +++++++++++++++++++
+ 7 files changed, 243 insertions(+), 1 deletion(-)
+ create mode 100644 frontend/src/store/activity.ts
+ create mode 100644 frontend/tests/utils/activity.test.ts
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index 09c6824..b879f0d 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -123,7 +123,22 @@ export async function getDownloadInfo(
+ 
+     const songList = dict.songList as Record<string, any>[] | undefined;
+     if (!songList || songList.length === 0) {
+-      throw new DownloadError(i18n.t("errors.download.noItems"));
++      // Apple answered without a failureType and without an item. The answer
++      // is not empty — it says something about why there is nothing to give —
++      // and throwing it away turned every one of these into the same dead end.
++      // The storefront is the usual reason: the app is not licensable there.
++      const customerMessage = dict.customerMessage as string | undefined;
++      const keys = Object.keys(dict).filter((key) => key !== "dialog");
++      const evidence = [
++        customerMessage,
++        `store=${account.store}`,
++        `keys=${keys.join(",") || "none"}`,
++      ]
++        .filter(Boolean)
++        .join(" ");
++      throw new DownloadError(
++        `${i18n.t("errors.download.noItems")} (${evidence})`,
++      );
+     }
+ 
+     const item = songList[0];
+diff --git a/frontend/src/components/Settings/DiagnosticsModal.tsx b/frontend/src/components/Settings/DiagnosticsModal.tsx
+index 1be5629..356c7c7 100644
+--- a/frontend/src/components/Settings/DiagnosticsModal.tsx
++++ b/frontend/src/components/Settings/DiagnosticsModal.tsx
+@@ -5,6 +5,7 @@ import Spinner from "../common/Spinner";
+ import { apiGet } from "../../api/client";
+ import { useAccountsStore } from "../../store/accounts";
+ import { useSapStore } from "../../store/sap";
++import { useActivityStore } from "../../store/activity";
+ import {
+   buildDiagnostics,
+   maskHardwareID,
+@@ -34,6 +35,7 @@ export default function DiagnosticsModal({
+   const accounts = useAccountsStore((state) => state.accounts);
+   const { stage, percent, error, hardwareID, setupStartedAt, events, lastError } =
+     useSapStore();
++  const activity = useActivityStore((s) => s.entries);
+   const addToast = useToastStore((state) => state.addToast);
+ 
+   const [report, setReport] = useState<string | null>(null);
+@@ -86,6 +88,7 @@ export default function DiagnosticsModal({
+           serverError,
+           sapAssets,
+           sapAssetsError,
++          activity,
+           signer: {
+             stage,
+             percent,
+diff --git a/frontend/src/hooks/useDownloadAction.ts b/frontend/src/hooks/useDownloadAction.ts
+index 0da84f0..3682471 100644
+--- a/frontend/src/hooks/useDownloadAction.ts
++++ b/frontend/src/hooks/useDownloadAction.ts
+@@ -1,6 +1,7 @@
+ import { useTranslation } from "react-i18next";
+ import { useAccounts } from "./useAccounts";
+ import { useToastStore } from "../store/toast";
++import { useActivityStore } from "../store/activity";
+ import { useDownloadsStore } from "../store/downloads";
+ import { getDownloadInfo, DownloadError } from "../apple/download";
+ import { purchaseApp, PurchaseError } from "../apple/purchase";
+@@ -18,6 +19,7 @@ import type { Account, Software } from "../types";
+ export function useDownloadAction() {
+   const { updateAccount } = useAccounts();
+   const addToast = useToastStore((s) => s.addToast);
++  const recordActivity = useActivityStore((s) => s.record);
+   const fetchTasks = useDownloadsStore((s) => s.fetchTasks);
+   const { t } = useTranslation();
+ 
+@@ -28,6 +30,30 @@ export function useDownloadAction() {
+   ) {
+     const ctx = getAccountContext(account, t);
+     const appName = app.name;
++    const beganAt = Date.now();
++
++    try {
++      await runDownload(account, app, versionId, appName, ctx);
++      recordActivity({ kind: "download", target: appName, ok: true, tookMs: Date.now() - beganAt });
++    } catch (error) {
++      recordActivity({
++        kind: "download",
++        target: appName,
++        ok: false,
++        detail: getErrorMessage(error, "unknown"),
++        tookMs: Date.now() - beganAt,
++      });
++      throw error;
++    }
++  }
++
++  async function runDownload(
++    account: Account,
++    app: Software,
++    versionId: string | undefined,
++    appName: string,
++    ctx: ReturnType<typeof getAccountContext>,
++  ) {
+ 
+     try {
+       const settings = await apiGet<{ maxDownloadMB: number }>("/api/settings");
+@@ -89,6 +115,29 @@ export function useDownloadAction() {
+   async function acquireLicense(account: Account, app: Software) {
+     const ctx = getAccountContext(account, t);
+     const appName = app.name;
++    const beganAt = Date.now();
++
++    try {
++      await runLicense(account, app, appName, ctx);
++      recordActivity({ kind: "license", target: appName, ok: true, tookMs: Date.now() - beganAt });
++    } catch (error) {
++      recordActivity({
++        kind: "license",
++        target: appName,
++        ok: false,
++        detail: getErrorMessage(error, "unknown"),
++        tookMs: Date.now() - beganAt,
++      });
++      throw error;
++    }
++  }
++
++  async function runLicense(
++    account: Account,
++    app: Software,
++    appName: string,
++    ctx: ReturnType<typeof getAccountContext>,
++  ) {
+ 
+     // Renewing the token used to happen first, unconditionally. authenticate()
+     // begins with prepareSigner(), and the signer lives in worker memory, so
+diff --git a/frontend/src/store/activity.ts b/frontend/src/store/activity.ts
+new file mode 100644
+index 0000000..3b9ba1f
+--- /dev/null
++++ b/frontend/src/store/activity.ts
+@@ -0,0 +1,41 @@
++import { create } from "zustand";
++
++/**
++ * What the app tried to do, and how it went.
++ *
++ * The diagnostics report only ever covered SAP setup. A user whose download
++ * failed could send a report and it would say nothing about the download — not
++ * what was searched, not what was clicked, not what Apple answered. Setup is
++ * one thing the app does; this records the rest.
++ */
++export interface ActivityEntry {
++  at: number;
++  kind: "search" | "license" | "download" | "authenticate";
++  /** What it was about, as the user would recognise it. Never a credential. */
++  target: string;
++  ok: boolean;
++  /** The failure, when it failed. Apple's own wording where there is one. */
++  detail?: string;
++  /** Milliseconds the attempt took. */
++  tookMs?: number;
++}
++
++/**
++ * A bounded ring. A session of clicking around produces dozens of entries and
++ * the report is meant to be pasted into a chat, so it cannot grow without end.
++ * The oldest entries are the least useful: whatever broke is recent.
++ */
++const LIMIT = 40;
++
++interface ActivityStore {
++  entries: ActivityEntry[];
++  record: (entry: Omit<ActivityEntry, "at"> & { at?: number }) => void;
++}
++
++export const useActivityStore = create<ActivityStore>()((set) => ({
++  entries: [],
++  record: (entry) =>
++    set((state) => ({
++      entries: [...state.entries, { at: Date.now(), ...entry }].slice(-LIMIT),
++    })),
++}));
+diff --git a/frontend/src/utils/diagnostics.ts b/frontend/src/utils/diagnostics.ts
+index aae24ca..ab20ea8 100644
+--- a/frontend/src/utils/diagnostics.ts
++++ b/frontend/src/utils/diagnostics.ts
+@@ -1,5 +1,6 @@
+ import type { Account } from "../types";
+ import type { SapStage } from "../store/sap";
++import type { ActivityEntry } from "../store/activity";
+ 
+ // Collects everything needed to diagnose a failed sign-in into one block of
+ // text that can be pasted into an issue.
+@@ -65,6 +66,8 @@ export interface DiagnosticsInput {
+   serverError?: string | null;
+   sapAssets?: SapAssetsStatus | null;
+   sapAssetsError?: string | null;
++  /** What the app tried to do recently, newest last. */
++  activity?: ActivityEntry[];
+   signer: {
+     stage: SapStage;
+     percent: number | null;
+@@ -309,5 +312,24 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
+     );
+   }
+ 
++  // Without this a report from a failed download says nothing about the
++  // download.
++  out.push("");
++  out.push("[activity]");
++  const activity = input.activity ?? [];
++  if (activity.length === 0) {
++    out.push("  none recorded");
++  } else {
++    for (const entry of activity) {
++      const took =
++        typeof entry.tookMs === "number" ? ` ${(entry.tookMs / 1000).toFixed(1)}s` : "";
++      const mark = entry.ok ? "ok" : "FAILED";
++      const detail = entry.detail ? ` — ${entry.detail}` : "";
++      out.push(
++        `  ${new Date(entry.at).toISOString()}  ${entry.kind}  ${entry.target}  ${mark}${took}${detail}`,
++      );
++    }
++  }
++
+   return out.join("\n");
+ }
+diff --git a/frontend/tests/hooks/useDownloadAction.test.tsx b/frontend/tests/hooks/useDownloadAction.test.tsx
+index d8c8f83..24547c8 100644
+--- a/frontend/tests/hooks/useDownloadAction.test.tsx
++++ b/frontend/tests/hooks/useDownloadAction.test.tsx
+@@ -37,6 +37,7 @@ vi.mock("react-i18next", () => ({
+ }));
+ 
+ const { useDownloadAction } = await import("../../src/hooks/useDownloadAction");
++const { useActivityStore } = await import("../../src/store/activity");
+ 
+ const account = {
+   email: "richard@example.com",
+@@ -66,6 +67,7 @@ describe("downloading an app the account has no licence for", () => {
+     purchaseApp.mockReset();
+     authenticate.mockReset();
+     apiPost.mockClear();
++    useActivityStore.setState({ entries: [] });
+   });
+ 
+   it("acquires the licence and carries on", async () => {
+@@ -148,3 +150,41 @@ describe("acquiring a licence", () => {
+     expect(authenticate).not.toHaveBeenCalled();
+   });
+ });
++
++// The report used to say nothing about a failed download, so there was nothing
++// to diagnose it from.
++describe("recording what was tried", () => {
++  beforeEach(() => {
++    getDownloadInfo.mockReset();
++    purchaseApp.mockReset();
++    authenticate.mockReset();
++    apiPost.mockClear();
++    useActivityStore.setState({ entries: [] });
++  });
++
++  it("records a download that failed and why", async () => {
++    getDownloadInfo.mockRejectedValue(new DownloadError("响应中没有项目 (store=143465 keys=dialog)", "x"));
++
++    const { result } = renderHook(() => useDownloadAction());
++    await expect(result.current.startDownload(account, app)).rejects.toThrow();
++
++    const entries = useActivityStore.getState().entries;
++    expect(entries).toHaveLength(1);
++    expect(entries[0].kind).toBe("download");
++    expect(entries[0].target).toBe("Candy Crush Saga");
++    expect(entries[0].ok).toBe(false);
++    expect(entries[0].detail).toContain("响应中没有项目");
++  });
++
++  it("records a licence that worked", async () => {
++    purchaseApp.mockResolvedValue({ updatedCookies: [] });
++
++    const { result } = renderHook(() => useDownloadAction());
++    await result.current.acquireLicense(account, app);
++
++    const entries = useActivityStore.getState().entries;
++    expect(entries).toHaveLength(1);
++    expect(entries[0].kind).toBe("license");
++    expect(entries[0].ok).toBe(true);
++  });
++});
+diff --git a/frontend/tests/utils/activity.test.ts b/frontend/tests/utils/activity.test.ts
+new file mode 100644
+index 0000000..62286ed
+--- /dev/null
++++ b/frontend/tests/utils/activity.test.ts
+@@ -0,0 +1,72 @@
++import { describe, it, expect, beforeEach } from "vitest";
++import { useActivityStore } from "../../src/store/activity";
++import { buildDiagnostics } from "../../src/utils/diagnostics";
++
++// A report from a failed download used to say nothing about the download.
++
++beforeEach(() => useActivityStore.setState({ entries: [] }));
++
++describe("the activity log", () => {
++  it("keeps what was tried and how it went", () => {
++    const { record } = useActivityStore.getState();
++    record({ kind: "license", target: "番茄小说", ok: true, tookMs: 900 });
++    record({ kind: "download", target: "番茄小说", ok: false, detail: "响应中没有项目 (store=143465 keys=dialog,pings)" });
++
++    const entries = useActivityStore.getState().entries;
++    expect(entries).toHaveLength(2);
++    expect(entries[0].kind).toBe("license");
++    expect(entries[1].ok).toBe(false);
++  });
++
++  it("stops growing, oldest first", () => {
++    const { record } = useActivityStore.getState();
++    for (let i = 0; i < 60; i++) {
++      record({ kind: "search", target: `app ${i}`, ok: true });
++    }
++    const entries = useActivityStore.getState().entries;
++    expect(entries.length).toBeLessThanOrEqual(40);
++    // Whatever broke is recent, so the recent end is what survives.
++    expect(entries[entries.length - 1].target).toBe("app 59");
++  });
++});
++
++describe("the report", () => {
++  const base = {
++    generatedAt: "2026-09-06T15:28:50.808Z",
++    browser: { userAgent: "x", language: "zh-CN", page: "p", secureContext: true, worker: "available" },
++    device: { cpuCores: 8, deviceMemoryGB: 16, platform: "Windows", visibilityState: "visible" },
++    signer: { stage: "idle", percent: null, setupSeconds: null, events: [], error: null, hardwareID: null },
++    accounts: [],
++    language: "zh-CN",
++  } as never;
++
++  it("says so when nothing was tried", () => {
++    const report = buildDiagnostics(base);
++    expect(report).toContain("[activity]");
++    expect(report).toContain("none recorded");
++  });
++
++  it("names the app and the reason it failed", () => {
++    useActivityStore.getState().record({
++      kind: "download",
++      target: "番茄小说",
++      ok: false,
++      detail: "响应中没有项目 (store=143465 keys=dialog,pings)",
++      tookMs: 1400,
++    });
++
++    const report = buildDiagnostics({
++      ...base,
++      activity: useActivityStore.getState().entries,
++    } as never);
++
++    expect(report).toContain("download");
++    expect(report).toContain("番茄小说");
++    expect(report).toContain("FAILED");
++    expect(report).toContain("store=143465");
++    // The setup timeline also prints "none recorded" when it is empty, so this
++    // has to look at the activity section on its own.
++    const section = report.slice(report.indexOf("[activity]"));
++    expect(section).not.toContain("none recorded");
++  });
++});
+-- 
+2.39.5
+

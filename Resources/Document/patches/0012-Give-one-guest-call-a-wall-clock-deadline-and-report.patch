@@ -1,0 +1,190 @@
+From be96fc5cedc46a4f900151572f8b23b186f3d5c2 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 13:08:11 +0000
+Subject: [PATCH] Give one guest call a wall-clock deadline and report it
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous commit capped unassisted instructions at 2M and predicted an error
+naming the address. A device running that build reported exchange.1 at 332
+seconds with no error. Its measured throughput is 5.3M instructions in 72.4s,
+so 2M is about 27 seconds of work — 332 seconds with no error means fewer than
+2M instructions ran unassisted. That hypothesis is dead.
+
+What is left cannot be told apart from outside. Each turn of the run loop reads
+a 480 byte window and decodes it before executing as few as one instruction, so
+per-block overhead and guest execution are indistinguishable from the report —
+and the emulator is synchronous, so nothing can be posted while it runs.
+
+So the guest call now has a 180 second wall-clock deadline and fails with the
+four numbers that separate the remaining explanations: blocks considered,
+blocks the decoder could not read, instructions run unassisted, and budget
+left. Many blocks against a barely-moved budget says the guest is looping or
+that per-block overhead dominates; a large unassisted figure says the previous
+cap is doing its job and simply has not been reached.
+
+180s because a desktop finishes the entire setup in 115s, so one call there is
+well under two minutes, and the reporting device runs at 1.2x that. Past three
+minutes a single call is not a slow device, it is a guest making no progress.
+
+deadlineExceeded and describeGuestRun carry four unit tests. As before, the
+part of run() that drives the emulator is not tested here; this environment has
+no real 38 MB binaries.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/sap/machine.ts          | 68 ++++++++++++++++++++++
+ frontend/tests/apple/guestDeadline.test.ts | 49 ++++++++++++++++
+ 2 files changed, 117 insertions(+)
+ create mode 100644 frontend/tests/apple/guestDeadline.test.ts
+
+diff --git a/frontend/src/apple/sap/machine.ts b/frontend/src/apple/sap/machine.ts
+index 9041eb3..e5fcbf5 100644
+--- a/frontend/src/apple/sap/machine.ts
++++ b/frontend/src/apple/sap/machine.ts
+@@ -66,6 +66,53 @@ const UNASSISTED_INSTRUCTION_LIMIT = 2_000_000;
+  * tested here, while the arithmetic that decides whether a guest is allowed to
+  * continue can be.
+  */
++// How long one guest call may take before it is called a failure.
++//
++// A desktop finishes the entire setup in 115 seconds, so one call there is
++// well under two minutes. The phone in the field reports runs at 1.2x that.
++// Anything past three minutes for a single call is not a slow device, it is a
++// guest that is not making progress — and the caller's own 15 minute timeout
++// is far too blunt to say anything about why.
++const GUEST_CALL_DEADLINE_MS = 180_000;
++
++export interface GuestRunStats {
++  /** Wall-clock milliseconds since the call began. */
++  elapsedMs: number;
++  /** Turns of the run loop, one per basic block considered. */
++  steps: number;
++  /** Blocks the decoder could not read. */
++  measureFailures: number;
++  /** Instructions handed to the emulator without splitting help. */
++  unassisted: number;
++  /** Remaining instruction budget. */
++  budget: number;
++}
++
++/**
++ * Whether a guest call has run past its deadline.
++ *
++ * Split out from run() for the same reason as unassistedAllowance: run() drives
++ * the emulator and cannot be unit tested here, while the decision can be.
++ */
++export function deadlineExceeded(
++  startedAt: number,
++  now: number,
++  limitMs: number = GUEST_CALL_DEADLINE_MS,
++): boolean {
++  return now - startedAt > limitMs;
++}
++
++/** The stats as one line, for an error message. */
++export function describeGuestRun(stats: GuestRunStats): string {
++  return (
++    `elapsed ${(stats.elapsedMs / 1000).toFixed(1)}s, ` +
++    `${stats.steps} blocks, ` +
++    `${stats.measureFailures} undecodable, ` +
++    `${stats.unassisted} unassisted instructions, ` +
++    `budget left ${stats.budget}`
++  );
++}
++
+ export function unassistedAllowance(
+   remaining: number,
+   alreadyRun: number,
+@@ -396,11 +443,32 @@ export class Machine {
+   private run(start: bigint): void {
+     let address = start;
+     let budget = INSTRUCTION_LIMIT;
++    const startedAt = Date.now();
++    let steps = 0;
++    let measureFailures = 0;
+ 
+     while (budget > 0) {
++      // Checked once per block rather than per instruction: the block loop is
++      // where the work happens, and a guest that is looping shows up here as
++      // steps climbing while the budget barely moves.
++      steps++;
++      if (deadlineExceeded(startedAt, Date.now())) {
++        throw new Error(
++          `SAP guest call exceeded ${GUEST_CALL_DEADLINE_MS / 1000}s ` +
++            `(${describeGuestRun({
++              elapsedMs: Date.now() - startedAt,
++              steps,
++              measureFailures,
++              unassisted: this.unassisted,
++              budget,
++            })})`,
++        );
++      }
++
+       const block = this.measure(address);
+ 
+       if (!block) {
++        measureFailures++;
+         // Undecodable: let the emulator run unassisted, but only up to a bound.
+         // An unbounded run here is both silent and longer than the caller's
+         // timeout, so it presents as a hang with nothing to report.
+diff --git a/frontend/tests/apple/guestDeadline.test.ts b/frontend/tests/apple/guestDeadline.test.ts
+new file mode 100644
+index 0000000..7b916c6
+--- /dev/null
++++ b/frontend/tests/apple/guestDeadline.test.ts
+@@ -0,0 +1,49 @@
++import { describe, it, expect } from "vitest";
++import {
++  deadlineExceeded,
++  describeGuestRun,
++} from "../../src/apple/sap/machine";
++
++// A report came back with exchange.1 running for 332 seconds. The 2M cap on
++// unassisted instructions had not fired, which rules that path out — at the
++// measured 73k instructions a second on that device the cap is 27 seconds of
++// work. The time was going somewhere the report could not see, so the guest
++// call now has a wall-clock deadline and reports where it was when it hit it.
++
++const T0 = Date.parse("2026-09-06T13:00:00.000Z");
++
++describe("deadlineExceeded", () => {
++  it("lets a call that a desktop would finish run", () => {
++    // A desktop completes the whole setup in 115s, so one call is well inside.
++    expect(deadlineExceeded(T0, T0 + 120_000)).toBe(false);
++  });
++
++  it("fires past three minutes", () => {
++    expect(deadlineExceeded(T0, T0 + 180_001)).toBe(true);
++  });
++
++  it("accepts an explicit limit", () => {
++    expect(deadlineExceeded(T0, T0 + 5_000, 1_000)).toBe(true);
++    expect(deadlineExceeded(T0, T0 + 500, 1_000)).toBe(false);
++  });
++});
++
++describe("describeGuestRun", () => {
++  it("carries the four numbers that tell the two failure modes apart", () => {
++    const text = describeGuestRun({
++      elapsedMs: 181_400,
++      steps: 4_200_000,
++      measureFailures: 3,
++      unassisted: 60_000,
++      budget: 99_940_000,
++    });
++
++    expect(text).toContain("elapsed 181.4s");
++    // Many blocks against a barely-moved budget says the guest is looping, or
++    // that per-block overhead dominates — not that it needs more instructions.
++    expect(text).toContain("4200000 blocks");
++    expect(text).toContain("3 undecodable");
++    expect(text).toContain("60000 unassisted instructions");
++    expect(text).toContain("budget left 99940000");
++  });
++});
+-- 
+2.39.5
+

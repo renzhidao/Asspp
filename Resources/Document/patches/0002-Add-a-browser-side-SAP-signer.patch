@@ -1,0 +1,3446 @@
+From 72e305cbfb0d56cec19b3efe979ce7db903d13ad Mon Sep 17 00:00:00 2001
+From: Tardisyuan <richard56500620@126.com>
+Date: Tue, 1 Sep 2026 20:34:59 +1000
+Subject: [PATCH 2/5] Add a browser-side SAP signer
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Apple began requiring a SAP-signed X-Apple-ActionSignature on authenticate in
+August. The bag says so directly: urlBag.sign-sap-request lists MZFinance:
+authenticate, auth/v1: native and auth/v1/native: fast, and all three answer
+an unsigned request with 403 and an empty body about 6 ms in, before looking
+at credentials.
+
+Ported from ipatool's internal/sap. macho.ts loads the guest images, length.ts
+decodes x86-64 instruction lengths, engine.ts wraps unicorn.js, shims.ts and
+platform.ts stand in for the macOS the guest expects, machine.ts drives the
+four entry points, and signer.ts runs the setup protocol.
+
+unicorn.js is the same Unicorn 2.1.4 ipatool loads, built to WebAssembly. Two
+things that build forces: a guest call is bounded by instruction count alone,
+since a non-zero timeout makes Unicorn spawn a timer thread it cannot create;
+and it aborts inside QEMU's Tiny Code Interpreter on a long basic block, so
+machine.ts splits long blocks itself by planting a HLT at a safe boundary and
+resuming from it. README.md in that directory carries the measurements and the
+reasoning.
+
+None of the setup involves credentials — the only identity is the hardware id,
+which is the guid already sent in the clear — so it can happen well before
+anyone types a password.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+---
+ frontend/package-lock.json             |   7 +
+ frontend/package.json                  |   1 +
+ frontend/src/apple/sap/README.md       | 152 +++++++
+ frontend/src/apple/sap/assets.ts       | 173 +++++++
+ frontend/src/apple/sap/client.ts       | 183 ++++++++
+ frontend/src/apple/sap/engine.ts       | 197 ++++++++
+ frontend/src/apple/sap/length.ts       | 388 ++++++++++++++++
+ frontend/src/apple/sap/machine.ts      | 594 +++++++++++++++++++++++++
+ frontend/src/apple/sap/macho.ts        | 556 +++++++++++++++++++++++
+ frontend/src/apple/sap/platform.ts     | 271 +++++++++++
+ frontend/src/apple/sap/shims.ts        | 424 ++++++++++++++++++
+ frontend/src/apple/sap/signer.ts       | 208 +++++++++
+ frontend/src/apple/sap/unicorn-js.d.ts |   8 +
+ frontend/src/apple/sap/worker.ts       | 104 +++++
+ frontend/vite.config.ts                |   3 +
+ 15 files changed, 3269 insertions(+)
+ create mode 100644 frontend/src/apple/sap/README.md
+ create mode 100644 frontend/src/apple/sap/assets.ts
+ create mode 100644 frontend/src/apple/sap/client.ts
+ create mode 100644 frontend/src/apple/sap/engine.ts
+ create mode 100644 frontend/src/apple/sap/length.ts
+ create mode 100644 frontend/src/apple/sap/machine.ts
+ create mode 100644 frontend/src/apple/sap/macho.ts
+ create mode 100644 frontend/src/apple/sap/platform.ts
+ create mode 100644 frontend/src/apple/sap/shims.ts
+ create mode 100644 frontend/src/apple/sap/signer.ts
+ create mode 100644 frontend/src/apple/sap/unicorn-js.d.ts
+ create mode 100644 frontend/src/apple/sap/worker.ts
+
+diff --git a/frontend/package-lock.json b/frontend/package-lock.json
+index 603cd87..37e4855 100644
+--- a/frontend/package-lock.json
++++ b/frontend/package-lock.json
+@@ -8,6 +8,7 @@
+       "name": "asspp-web",
+       "version": "0.0.1",
+       "dependencies": {
++        "@alexaltea/unicorn-js": "^2.1.4",
+         "i18next": "^23.10.0",
+         "i18next-browser-languagedetector": "^7.2.0",
+         "idb": "^8.0.1",
+@@ -51,6 +52,12 @@
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/@alexaltea/unicorn-js": {
++      "version": "2.1.4",
++      "resolved": "https://registry.npmjs.org/@alexaltea/unicorn-js/-/unicorn-js-2.1.4.tgz",
++      "integrity": "sha512-UAml23tgHyXEuP2A7Y50qDCNYMIRHJobsjlhetPRrtH+PXg0+BNAyvPQEKoCd+VHAF1nDfPHE4yJCqSLVtOrXA==",
++      "license": "GPL-2.0"
++    },
+     "node_modules/@asamuzakjp/css-color": {
+       "version": "4.1.2",
+       "resolved": "https://registry.npmjs.org/@asamuzakjp/css-color/-/css-color-4.1.2.tgz",
+diff --git a/frontend/package.json b/frontend/package.json
+index cd2c676..bd89601 100644
+--- a/frontend/package.json
++++ b/frontend/package.json
+@@ -11,6 +11,7 @@
+     "test:watch": "vitest"
+   },
+   "dependencies": {
++    "@alexaltea/unicorn-js": "^2.1.4",
+     "i18next": "^23.10.0",
+     "i18next-browser-languagedetector": "^7.2.0",
+     "idb": "^8.0.1",
+diff --git a/frontend/src/apple/sap/README.md b/frontend/src/apple/sap/README.md
+new file mode 100644
+index 0000000..0c854af
+--- /dev/null
++++ b/frontend/src/apple/sap/README.md
+@@ -0,0 +1,152 @@
++# Browser-side SAP signing
++
++Apple gated the authenticate endpoint behind a SAP signature in August 2026.
++The bag says so directly — `urlBag.sign-sap-request` lists `MZFinance:
++authenticate`, `auth/v1: native` and `auth/v1/native: fast` — and every one of
++those endpoints now answers an unsigned request with `403` and an empty body,
++about 6ms in, before it looks at credentials.
++
++ipatool 2.4.0 solved this by running Apple's own signing code from a 2013 OS X
++release under a CPU emulator. This is a port of that approach to the browser,
++so the signature is produced client-side and the server keeps knowing nothing
++about Apple credentials.
++
++The binaries it runs are fetched from Apple's software update CDN the first
++time anyone signs in, and kept in the backend's data directory afterwards, so
++a fresh deployment needs nothing done to it by hand.
++
++## Where it stands
++
++The signer works, and Apple accepts what it produces. Sending the same
++deliberately wrong credentials with and without a signature separates the two
++cases cleanly:
++
++```
++without signature:  HTTP 403, empty body            rejected at the edge
++with signature:     HTTP 200, 326 bytes, a plist    credentials evaluated
++                    customerMessage: MZFinance.BadLogin.Configurator_message
++```
++
++That second response is the ordinary "wrong password" answer, which is the
++point: the request got as far as the credential check. Setup itself completes
++against Apple too — the certificate comes from s.mzstatic.com and the setup
++buffer round-trips through fpinit.itunes.apple.com, both HTTP 200.
++
++It is slow. Measured end to end in Chrome, driving the worker the way sign-in
++does:
++
++```
++assets      35 ms   (local disk; ~38 MB over the network on a cold cache)
++setup      115 s    5.3M guest instructions for initialize, ~5M for the
++                    two exchange rounds
++signing     12 s    per signature
++```
++
++Node runs the same setup in 63 s, so Chrome is roughly twice as slow. WebKit
++is much faster than either — 35 s for setup and 3.5 s per signature, measured
++with Playwright's WebKit under an iPhone 15 profile — so Safari users get a
++first sign-in in about forty seconds where Chrome users wait two minutes.
++
++Setup happens once per session and a signature once per sign-in attempt. Both
++run in a Web Worker and both report progress; neither is fast enough anywhere
++to go quiet.
++
++Nothing in setup involves credentials. The only identity is the hardware id,
++which is the same guid the client already sends in the clear, so the setup can
++happen well before anyone types a password.
++
++It runs on WebKit, which is what matters for iOS. `tools/webkit-check.mjs`
++drives the signer through Playwright's WebKit under an iPhone 15 profile and
++gets a 501-byte signature, with WebAssembly, dedicated workers, the Cache API
++and BigInt all behaving:
++
++```
++capability: webassembly ✓  worker ✓  caches ✓  bigint ✓
++setup 34.9 s, signing 3.5 s, signature 501 bytes
++```
++
++What that does not settle is memory on an actual phone. Measuring the
++worker's footprint directly needs `measureUserAgentSpecificMemory` and so
++cross-origin isolation, which this app does not have, but the guest mapping
++is 144 MB and the assets another 38, so it is on the order of 200 MB. A
++desktop WebKit has far more headroom than an iPhone, so the remaining risk is
++a device killing the tab under memory pressure — which only a real device can
++answer.
++
++## The block splitter
++
++unicorn.js cannot execute a basic block beyond a certain length. Synthetic
++blocks of `nop` and of `mov rax,rcx` both survive 88 instructions and both
++trap at 96, despite differing three-fold in bytes, so the limit counts
++interpreter operations rather than bytes:
++
++```
++TODO .../unicorn/qemu/tcg/tci.c:1272: tcg_qemu_tb_exec_x86_64()
++Aborted()
++```
++
++WebAssembly cannot emit native code, so this build runs QEMU's Tiny Code
++Interpreter rather than the usual JIT, and `tci.c` aborts on an unimplemented
++path. The guest is full of blocks over that length — the one `initialize`
++calls into is 134 straight-line moves — and the emulator offers no way to
++bound them: `uc_ctl` is the one entry point unicorn.js does not export, and it
++only sizes the TCG buffer anyway.
++
++So `machine.ts` splits blocks itself. A HLT goes in at a safe boundary, the
++guest stops on it, the original byte goes back, and execution resumes from the
++same address. Only the translator can tell.
++
++Three things this requires:
++
++**Boundaries.** `length.ts` decodes the x86-64 encoding structure without
++caring what any instruction does. objdump cannot supply them: its linear sweep
++desyncs on these obfuscated images and reports valid instructions as bad
++opcodes, and a HLT planted at a boundary taken from that output manufactures
++an invalid opcode — which traps exactly like the bug being chased.
++
++**One block at a time.** Taking a branch also translates its target, so
++letting execution chain hands the emulator a block of the guest's choosing.
++The target's split has to be planted before the branch runs, which means
++resolving the branch first: relative displacements come out of the encoding,
++an indirect call through a jump table needs its ModRM and SIB evaluated
++against live registers, and a return reads its target off the stack.
++
++**A split must not land on the instruction about to run.** The back edge of a
++nine-instruction loop does exactly that whenever the limit is eight.
++
++The limit is 32. Measured over a full setup: 32 works and takes 63s, 48 works
++but takes 76s, and 64 traps.
++
++## Layout
++
++| File | Role |
++| --- | --- |
++| `macho.ts` | Mach-O loader: x86-64 slice, segments, symbols, dyld rebase and bind opcodes |
++| `length.ts` | x86-64 length decoder and basic-block measurement |
++| `engine.ts` | unicorn.js wrapper, matching ipatool's `internal/sap/unicorn` |
++| `shims.ts` | Guest service area, calling convention, heap allocator |
++| `platform.ts` | The macOS imports the guest expects: CoreFoundation, IOKit, dlopen, `_read` for CoreFP.icxs |
++| `machine.ts` | Loads the images, splits blocks, drives initialize / exchange / sign / teardown |
++| `signer.ts` | The setup protocol and the signing entry point |
++
++## Notes for whoever picks this up
++
++Four bugs cost real time, all in the same shape — a length computed one byte
++wrong, which plants a HLT mid-instruction, which traps exactly like the
++emulator limit:
++
++- Segment offsets are `uint64` in the original and linkers rely on the wrap.
++  CoreFP encodes a backward jump of `-0x938` as `ADD_ADDR_ULEB
++  0xfffffffffffff6c8`; BigInt has no width, so every offset step masks to 64
++  bits.
++- `BIND_OPCODE_DONE` means different things per stream: it separates one
++  symbol's sequence from the next in a lazy stream, but ends the regular and
++  weak streams, which are followed by padding that must not be parsed.
++- `SHLD`/`SHRD` by an immediate (`0F A4`, `0F AC`) carry an imm8. The guest's
++  obfuscation is full of them.
++- `Jcc rel32` (`0F 80`–`0F 8F`) carries no ModRM byte.
++
++The emulator, not objdump, is the ground truth for boundaries: if an executed
++address is one the decoder would not have produced, the decoder is wrong.
++`Shims.trace`, `Machine.traceInstructions` and `Machine.setUnmappedTrace` are
++there for exactly that, since faults arrive without addresses.
+diff --git a/frontend/src/apple/sap/assets.ts b/frontend/src/apple/sap/assets.ts
+new file mode 100644
+index 0000000..2a0cb0f
+--- /dev/null
++++ b/frontend/src/apple/sap/assets.ts
+@@ -0,0 +1,173 @@
++// Fetches the Apple binaries the SAP signer runs under emulation.
++//
++// They total about 38 MB and never change — they come from a 2013 OS X
++// release — so they are cached and reused. The backend serves them from its
++// data directory, and fetches them from Apple the first time they are asked
++// for, so a fresh deployment needs nothing done to it by hand.
++
++import type { AssetBundle } from "./machine";
++
++const CACHE_NAME = "sap-assets-v2";
++
++const FILES = {
++  commerceKit: "CommerceKit",
++  commerceCore: "CommerceCore",
++  coreFP: "CoreFP",
++  coreFPICXS: "CoreFP.icxs",
++} as const;
++
++export interface AssetProgress {
++  name: string;
++  loaded: number;
++  total: number;
++}
++
++interface AssetStatus {
++  ready: boolean;
++  fetching: boolean;
++  missing: string[];
++  progress: { stage: string; found: string[] } | null;
++  error: string | null;
++}
++
++const FETCH_POLL_MS = 3000;
++const FETCH_TIMEOUT_MS = 10 * 60 * 1000;
++
++async function status(headers: Record<string, string>): Promise<AssetStatus> {
++  const response = await fetch("/api/sap/assets", { headers });
++  if (!response.ok) throw new Error("cannot reach the SAP asset service");
++  return response.json();
++}
++
++/**
++ * Makes sure the backend has the assets, asking it to fetch them from Apple
++ * if not. They land in its data directory and stay there, so this is a
++ * one-off on a fresh deployment rather than something every visitor pays.
++ */
++async function ensureInstalled(
++  headers: Record<string, string>,
++  onProgress?: (progress: AssetProgress) => void,
++): Promise<void> {
++  let state = await status(headers);
++  if (state.ready) return;
++
++  if (!state.fetching) {
++    const response = await fetch("/api/sap/assets/fetch", {
++      method: "POST",
++      headers,
++    });
++    if (!response.ok) {
++      throw new Error("the server could not start fetching the SAP assets");
++    }
++  }
++
++  const deadline = Date.now() + FETCH_TIMEOUT_MS;
++  for (;;) {
++    if (Date.now() > deadline) {
++      throw new Error("timed out waiting for the server to fetch the SAP assets");
++    }
++
++    await new Promise((resolve) => setTimeout(resolve, FETCH_POLL_MS));
++    state = await status(headers);
++
++    if (state.ready) return;
++    if (state.error) throw new Error(state.error);
++
++    // Report as an asset-shaped step so the caller has one progress channel.
++    const found = state.progress?.found.length ?? 0;
++    onProgress?.({
++      name: state.progress?.stage ?? "server",
++      loaded: found,
++      total: 4,
++    });
++  }
++}
++
++/** Reports whether the backend has the assets, without downloading them. */
++export async function assetsReady(
++  headers: Record<string, string> = {},
++): Promise<boolean> {
++  try {
++    const response = await fetch("/api/sap/assets", { headers });
++    if (!response.ok) return false;
++    return Boolean((await response.json()).ready);
++  } catch {
++    return false;
++  }
++}
++
++async function fetchAsset(
++  name: string,
++  headers: Record<string, string>,
++  onProgress?: (progress: AssetProgress) => void,
++): Promise<Uint8Array> {
++  const url = `/api/sap/assets/${name}`;
++
++  // The Cache API is unavailable on insecure origins, so treat it as an
++  // optimisation rather than a requirement.
++  let cache: Cache | null = null;
++  try {
++    cache = await caches.open(CACHE_NAME);
++    const hit = await cache.match(url);
++    if (hit) {
++      const bytes = new Uint8Array(await hit.arrayBuffer());
++      onProgress?.({ name, loaded: bytes.length, total: bytes.length });
++      return bytes;
++    }
++  } catch {
++    cache = null;
++  }
++
++  const response = await fetch(url, { headers });
++  if (!response.ok) {
++    const detail = await response.json().catch(() => ({}));
++    throw new Error(detail.error ?? `failed to fetch SAP asset ${name}`);
++  }
++
++  try {
++    await cache?.put(url, response.clone());
++  } catch {
++    // A full or unavailable cache only costs a re-download next time.
++  }
++
++  const total = Number(response.headers.get("Content-Length") ?? 0);
++  if (!response.body || !onProgress) {
++    return new Uint8Array(await response.arrayBuffer());
++  }
++
++  const reader = response.body.getReader();
++  const chunks: Uint8Array[] = [];
++  let loaded = 0;
++
++  for (;;) {
++    const { done, value } = await reader.read();
++    if (done) break;
++    chunks.push(value);
++    loaded += value.length;
++    onProgress({ name, loaded, total });
++  }
++
++  const bytes = new Uint8Array(loaded);
++  let offset = 0;
++  for (const chunk of chunks) {
++    bytes.set(chunk, offset);
++    offset += chunk.length;
++  }
++
++  return bytes;
++}
++
++export async function loadAssets(
++  headers: Record<string, string> = {},
++  onProgress?: (progress: AssetProgress) => void,
++): Promise<AssetBundle> {
++  await ensureInstalled(headers, onProgress);
++
++  const entries = await Promise.all(
++    Object.entries(FILES).map(async ([key, name]) => {
++      return [key, await fetchAsset(name, headers, onProgress)] as const;
++    }),
++  );
++
++  return Object.fromEntries(entries) as unknown as AssetBundle;
++}
+diff --git a/frontend/src/apple/sap/client.ts b/frontend/src/apple/sap/client.ts
+new file mode 100644
+index 0000000..f2f5ac4
+--- /dev/null
++++ b/frontend/src/apple/sap/client.ts
+@@ -0,0 +1,183 @@
++// Main-thread handle on the SAP signer worker.
++//
++// Apple began requiring a SAP signature on authenticate in August 2026, and
++// producing one means emulating Apple's own signing code. Measured in Chrome
++// on a laptop: setup takes about 115 seconds and each signature about 12.
++// Setup happens once per session, a signature once per sign-in attempt, and
++// both are slow enough to need saying so on screen.
++//
++// The signer is created lazily, so a session that never signs in never pays
++// for it, and the assets are only fetched when they are about to be used.
++
++import { getAccessToken } from "../../components/Auth/PasswordGate";
++import { useSapStore } from "../../store/sap";
++import type { AssetProgress } from "./assets";
++import type { WorkerRequest, WorkerResponse } from "./worker";
++
++export type SetupProgress =
++  | { phase: "assets"; asset: AssetProgress }
++  | { phase: "setup" }
++  | { phase: "signing" };
++
++const SETUP_TIMEOUT_MS = 15 * 60 * 1000;
++
++let worker: Worker | null = null;
++let ready: Promise<void> | null = null;
++let preparedFor: string | null = null;
++let nextId = 1;
++
++const store = () => useSapStore.getState();
++
++const pending = new Map<
++  number,
++  { resolve: (signature: Uint8Array) => void; reject: (error: Error) => void }
++>();
++
++let onProgress: ((progress: SetupProgress) => void) | null = null;
++let settleSetup: { resolve: () => void; reject: (error: Error) => void } | null = null;
++
++function handle(event: MessageEvent<WorkerResponse>) {
++  const message = event.data;
++
++  if (message.type === "progress") {
++    if (message.phase === "assets") {
++      const { loaded, total } = message.asset;
++      store().setAssets(total ? Math.round((loaded / total) * 100) : 0);
++      onProgress?.({ phase: "assets", asset: message.asset });
++    } else {
++      store().setSetup();
++      onProgress?.({ phase: "setup" });
++    }
++    return;
++  }
++
++  if (message.type === "ready") {
++    store().setReady();
++    settleSetup?.resolve();
++    settleSetup = null;
++    return;
++  }
++
++  if (message.type === "signed") {
++    pending.get(message.id)?.resolve(message.signature);
++    pending.delete(message.id);
++    return;
++  }
++
++  const error = new Error(message.message);
++  store().setError(error.message);
++
++  if (message.id !== undefined) {
++    pending.get(message.id)?.reject(error);
++    pending.delete(message.id);
++    return;
++  }
++
++  settleSetup?.reject(error);
++  settleSetup = null;
++  // A failed setup leaves nothing usable, so let the next attempt start over.
++  reset(error);
++}
++
++function reset(error: Error) {
++  for (const waiter of pending.values()) waiter.reject(error);
++  pending.clear();
++
++  worker?.terminate();
++  worker = null;
++  ready = null;
++  preparedFor = null;
++  store().setError(error.message);
++}
++
++/**
++ * Prepares the signer, reusing it if one is already set up for this hardware
++ * id. Safe to call more than once; concurrent callers share the same setup.
++ *
++ * A signer is bound to the hardware id it was initialised with, so switching
++ * accounts means building a new one rather than signing with the wrong
++ * identity.
++ */
++export function prepareSigner(
++  hardwareID: string,
++  progress?: (progress: SetupProgress) => void,
++): Promise<void> {
++  onProgress = progress ?? null;
++
++  if (ready && preparedFor === hardwareID) return ready;
++  if (ready) reset(new Error("SAP signer rebuilt for a different device"));
++
++  preparedFor = hardwareID;
++  store().begin(hardwareID);
++
++  worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
++  worker.onmessage = handle;
++  worker.onerror = (event) => {
++    reset(new Error(event.message || "SAP signer worker failed"));
++  };
++
++  // Without this a worker that wedges — a stalled fetch, an emulator that
++  // never returns — leaves the caller waiting forever with nothing on screen
++  // and no request ever going out. Generous, because a cold deployment has to
++  // fetch 38 MB from Apple before it can even start.
++  ready = new Promise<void>((resolve, reject) => {
++    const timer = setTimeout(() => {
++      reject(new Error("timed out preparing the SAP signer"));
++      reset(new Error("timed out preparing the SAP signer"));
++    }, SETUP_TIMEOUT_MS);
++
++    settleSetup = {
++      resolve: () => {
++        clearTimeout(timer);
++        resolve();
++      },
++      reject: (error) => {
++        clearTimeout(timer);
++        reject(error);
++      },
++    };
++  });
++
++  const request: WorkerRequest = {
++    type: "setup",
++    hardwareID: hexToBytes(hardwareID),
++    // sessionStorage exists only here, not in the worker.
++    accessToken: getAccessToken(),
++  };
++  worker.postMessage(request);
++
++  return ready;
++}
++
++/** Signs a request body. The signer must have been prepared first. */
++export function signAction(payload: Uint8Array): Promise<Uint8Array> {
++  if (!worker || !ready) {
++    return Promise.reject(new Error("SAP signer is not prepared"));
++  }
++
++  return ready.then(
++    () =>
++      new Promise<Uint8Array>((resolve, reject) => {
++        const id = nextId++;
++        pending.set(id, { resolve, reject });
++
++        const request: WorkerRequest = { type: "sign", id, payload };
++        worker!.postMessage(request, [payload.buffer]);
++      }),
++  );
++}
++
++/** The guid is hex; the signer wants the bytes behind it. */
++function hexToBytes(hex: string): Uint8Array {
++  const clean = hex.replace(/[^0-9a-fA-F]/g, "");
++  if (clean.length === 0 || clean.length % 2 !== 0 || clean.length > 40) {
++    throw new Error("device identifier must be 1 to 20 hex-encoded bytes");
++  }
++
++  const bytes = new Uint8Array(clean.length / 2);
++  for (let index = 0; index < bytes.length; index++) {
++    bytes[index] = parseInt(clean.slice(index * 2, index * 2 + 2), 16);
++  }
++
++  return bytes;
++}
+diff --git a/frontend/src/apple/sap/engine.ts b/frontend/src/apple/sap/engine.ts
+new file mode 100644
+index 0000000..7a6d328
+--- /dev/null
++++ b/frontend/src/apple/sap/engine.ts
+@@ -0,0 +1,197 @@
++// Thin wrapper over unicorn.js, matching the surface ipatool's
++// internal/sap/unicorn exposes.
++//
++// ipatool loads libunicorn through purego and calls fourteen uc_* entry
++// points. unicorn.js is the same engine (2.1.4) built to WebAssembly, and it
++// provides all of them except uc_ctl, which is only used on Windows to shrink
++// the TCG buffer and is a no-op everywhere else.
++
++// eslint-disable-next-line @typescript-eslint/no-explicit-any
++type UnicornModule = any;
++
++let modulePromise: Promise<UnicornModule> | null = null;
++
++/** Loads the x86 build of unicorn.js once per page. */
++async function loadUnicorn(): Promise<UnicornModule> {
++  if (!modulePromise) {
++    modulePromise = import("@alexaltea/unicorn-js/x86").then(
++      (module: { default: () => Promise<UnicornModule> }) => module.default(),
++    );
++  }
++  return modulePromise;
++}
++
++export interface CodeHook {
++  remove(): void;
++}
++
++export class Engine {
++  private readonly uc: UnicornModule;
++  // eslint-disable-next-line @typescript-eslint/no-explicit-any
++  private readonly engine: any;
++  private closed = false;
++
++  readonly regRDI: number;
++  readonly regRSI: number;
++  readonly regRDX: number;
++  readonly regRCX: number;
++  readonly regR8: number;
++  readonly regR9: number;
++  readonly regRSP: number;
++  readonly regRAX: number;
++  readonly regRIP: number;
++
++  private constructor(uc: UnicornModule) {
++    this.uc = uc;
++    this.engine = new uc.Unicorn(uc.ARCH_X86, uc.MODE_64);
++
++    this.regRDI = uc.X86_REG_RDI;
++    this.regRSI = uc.X86_REG_RSI;
++    this.regRDX = uc.X86_REG_RDX;
++    this.regRCX = uc.X86_REG_RCX;
++    this.regR8 = uc.X86_REG_R8;
++    this.regR9 = uc.X86_REG_R9;
++    this.regRSP = uc.X86_REG_RSP;
++    this.regRAX = uc.X86_REG_RAX;
++    this.regRIP = uc.X86_REG_RIP;
++  }
++
++  static async create(): Promise<Engine> {
++    return new Engine(await loadUnicorn());
++  }
++
++  memMap(address: bigint, size: bigint): void {
++    this.engine.mem_map(address, Number(size), this.uc.PROT_ALL);
++  }
++
++  memWrite(address: bigint, data: Uint8Array): void {
++    if (data.length === 0) return;
++    this.engine.mem_write(address, data);
++  }
++
++  memRead(address: bigint, size: number): Uint8Array {
++    return this.engine.mem_read(address, size);
++  }
++
++  memZero(address: bigint, size: number): void {
++    if (size === 0) return;
++    this.engine.mem_write(address, new Uint8Array(size));
++  }
++
++  /** Reads a general-purpose register by its x86 encoding number, 0 to 15. */
++  gpr(index: number): bigint {
++    const order = [
++      this.uc.X86_REG_RAX, this.uc.X86_REG_RCX, this.uc.X86_REG_RDX,
++      this.uc.X86_REG_RBX, this.uc.X86_REG_RSP, this.uc.X86_REG_RBP,
++      this.uc.X86_REG_RSI, this.uc.X86_REG_RDI, this.uc.X86_REG_R8,
++      this.uc.X86_REG_R9, this.uc.X86_REG_R10, this.uc.X86_REG_R11,
++      this.uc.X86_REG_R12, this.uc.X86_REG_R13, this.uc.X86_REG_R14,
++      this.uc.X86_REG_R15,
++    ];
++    return this.regRead(order[index]);
++  }
++
++  regRead(register: number): bigint {
++    return BigInt(this.engine.reg_read_i64(register)) & ((1n << 64n) - 1n);
++  }
++
++  regWrite(register: number, value: bigint): void {
++    this.engine.reg_write_i64(register, BigInt.asIntN(64, value));
++  }
++
++  readUint32(address: bigint): number {
++    const data = this.memRead(address, 4);
++    return new DataView(data.buffer, data.byteOffset, 4).getUint32(0, true);
++  }
++
++  readUint64(address: bigint): bigint {
++    const data = this.memRead(address, 8);
++    return new DataView(data.buffer, data.byteOffset, 8).getBigUint64(0, true);
++  }
++
++  writeUint32(address: bigint, value: number): void {
++    const data = new Uint8Array(4);
++    new DataView(data.buffer).setUint32(0, value >>> 0, true);
++    this.memWrite(address, data);
++  }
++
++  writeUint64(address: bigint, value: bigint): void {
++    const data = new Uint8Array(8);
++    new DataView(data.buffer).setBigUint64(0, value & ((1n << 64n) - 1n), true);
++    this.memWrite(address, data);
++  }
++
++  /** Installs a UC_HOOK_CODE over [begin, end], the only hook kind SAP needs. */
++  addCodeHook(
++    begin: bigint,
++    end: bigint,
++    callback: (address: bigint) => void,
++  ): CodeHook {
++    const handle = this.engine.hook_add(
++      this.uc.HOOK_CODE,
++      // eslint-disable-next-line @typescript-eslint/no-explicit-any
++      (_handle: any, address: bigint | number) => {
++        callback(typeof address === "bigint" ? address : BigInt(address));
++      },
++      {},
++      begin,
++      end,
++    );
++
++    return {
++      remove: () => {
++        this.engine.hook_del(handle);
++      },
++    };
++  }
++
++  /**
++   * Reports guest accesses to unmapped memory. ipatool never needs this: the
++   * Go build surfaces them as UC_ERR_READ_UNMAPPED from uc_emu_start, while
++   * this WebAssembly build traps instead, losing the address. Catching them
++   * here keeps the fault diagnosable.
++   */
++  addUnmappedHook(
++    callback: (kind: string, address: bigint, size: number) => void,
++  ): CodeHook {
++    const kinds: Array<[number, string]> = [
++      [this.uc.HOOK_MEM_READ_UNMAPPED, "read"],
++      [this.uc.HOOK_MEM_WRITE_UNMAPPED, "write"],
++      [this.uc.HOOK_MEM_FETCH_UNMAPPED, "fetch"],
++    ];
++
++    const mask = kinds.reduce((total, [flag]) => total | flag, 0);
++    const handle = this.engine.hook_add(
++      mask,
++      // eslint-disable-next-line @typescript-eslint/no-explicit-any
++      (_handle: any, type: number, address: bigint | number, size: number) => {
++        const kind = kinds.find(([flag]) => flag === type)?.[1] ?? String(type);
++        callback(kind, typeof address === "bigint" ? address : BigInt(address), size);
++        return false;
++      },
++      {},
++      1n,
++      0n,
++    );
++
++    return {
++      remove: () => {
++        this.engine.hook_del(handle);
++      },
++    };
++  }
++
++  start(begin: bigint, end: bigint, timeoutMicros: bigint, instructionLimit: number): void {
++    this.engine.emu_start(begin, end, timeoutMicros, instructionLimit);
++  }
++
++  stop(): void {
++    this.engine.emu_stop();
++  }
++
++  close(): void {
++    if (this.closed) return;
++    this.closed = true;
++    this.engine.close();
++  }
++}
+diff --git a/frontend/src/apple/sap/length.ts b/frontend/src/apple/sap/length.ts
+new file mode 100644
+index 0000000..cb46770
+--- /dev/null
++++ b/frontend/src/apple/sap/length.ts
+@@ -0,0 +1,388 @@
++// x86-64 instruction length decoder.
++//
++// unicorn.js traps on any basic block longer than about ninety instructions,
++// so the machine splits long blocks by planting a temporary HLT at a safe
++// point ahead of the guest and continuing from there. That needs instruction
++// boundaries, and the guest images are obfuscated badly enough that objdump's
++// linear sweep desyncs and reports valid instructions as bad opcodes.
++//
++// Only lengths are needed, never semantics, so this decodes the encoding
++// structure — prefixes, REX, opcode, ModRM, SIB, displacement, immediate —
++// and does not care what any instruction does. It also reports whether an
++// instruction ends a basic block, since the emulator will end one there
++// anyway and there is no point planting a HLT past it.
++
++const enum Imm {
++  None = 0,
++  Byte = 1,
++  Word = 2,
++  /** 4 bytes, or 2 with an operand-size prefix. */
++  Zed = 3,
++  /** 4 bytes, or 8 for a REX.W MOV. */
++  Vee = 4,
++}
++
++/** Opcodes taking a ModRM byte, one bit per opcode. */
++const ONE_BYTE_MODRM = new Uint8Array(256);
++for (const range of [
++  [0x00, 0x03], [0x08, 0x0b], [0x10, 0x13], [0x18, 0x1b],
++  [0x20, 0x23], [0x28, 0x2b], [0x30, 0x33], [0x38, 0x3b],
++  [0x62, 0x63], [0x69, 0x69], [0x6b, 0x6b], [0x80, 0x8f],
++  [0xc0, 0xc1], [0xc4, 0xc7], [0xd0, 0xd3], [0xd8, 0xdf],
++  [0xf6, 0xf7], [0xfe, 0xff],
++]) {
++  for (let code = range[0]; code <= range[1]; code++) ONE_BYTE_MODRM[code] = 1;
++}
++
++const ONE_BYTE_IMMEDIATE = new Uint8Array(256);
++function setImmediate(from: number, to: number, kind: Imm) {
++  for (let code = from; code <= to; code++) ONE_BYTE_IMMEDIATE[code] = kind;
++}
++for (const base of [0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x38]) {
++  setImmediate(base + 4, base + 4, Imm.Byte); // AL, imm8
++  setImmediate(base + 5, base + 5, Imm.Zed); // eAX, imm
++}
++setImmediate(0x68, 0x68, Imm.Zed);
++setImmediate(0x69, 0x69, Imm.Zed);
++setImmediate(0x6a, 0x6a, Imm.Byte);
++setImmediate(0x6b, 0x6b, Imm.Byte);
++setImmediate(0x70, 0x7f, Imm.Byte); // Jcc rel8
++setImmediate(0x80, 0x80, Imm.Byte);
++setImmediate(0x81, 0x81, Imm.Zed);
++setImmediate(0x83, 0x83, Imm.Byte);
++setImmediate(0xa8, 0xa8, Imm.Byte);
++setImmediate(0xa9, 0xa9, Imm.Zed);
++setImmediate(0xb0, 0xb7, Imm.Byte); // MOV r8, imm8
++setImmediate(0xb8, 0xbf, Imm.Vee); // MOV r, imm
++setImmediate(0xc0, 0xc1, Imm.Byte);
++setImmediate(0xc2, 0xc2, Imm.Word);
++setImmediate(0xc6, 0xc6, Imm.Byte);
++setImmediate(0xc7, 0xc7, Imm.Zed);
++setImmediate(0xc8, 0xc8, Imm.Word); // ENTER takes imm16 then imm8
++setImmediate(0xcd, 0xcd, Imm.Byte);
++setImmediate(0xe8, 0xe9, Imm.Zed); // CALL/JMP rel32
++setImmediate(0xe0, 0xe7, Imm.Byte);
++setImmediate(0xeb, 0xeb, Imm.Byte);
++
++/** Two-byte (0x0F) opcodes that take no ModRM byte. */
++const TWO_BYTE_NO_MODRM = new Set([
++  0x05, 0x06, 0x07, 0x08, 0x09, 0x0b, 0x0e, 0x30, 0x31, 0x32, 0x33, 0x34,
++  0x35, 0x37, 0x77, 0xa0, 0xa1, 0xa2, 0xa8, 0xa9, 0xaa, 0xc8, 0xc9, 0xca,
++  0xcb, 0xcc, 0xcd, 0xce, 0xcf,
++]);
++
++export interface Decoded {
++  length: number;
++  /** True for branches, calls, returns and interrupts. */
++  endsBlock: boolean;
++  /**
++   * For a direct relative branch, its displacement from the end of the
++   * instruction. Absent for indirect branches and returns, whose target only
++   * exists at run time.
++   */
++  relative?: number;
++  /**
++   * For an indirect branch through memory, how to compute the address its
++   * target pointer sits at. Register numbers are already REX-extended.
++   */
++  indirect?: {
++    base: number | null;
++    index: number | null;
++    scale: number;
++    displacement: number;
++    /** True when the address is relative to the end of the instruction. */
++    ripRelative: boolean;
++    /** True for `call rax` style, where the register holds the target. */
++    register: number | null;
++  };
++}
++
++/**
++ * Decodes the instruction at `offset`, returning its length in bytes.
++ * Throws when the encoding is not recognised, which the caller should treat
++ * as "stop scanning" rather than as a fatal error.
++ */
++export function decode(code: Uint8Array, offset: number): Decoded {
++  let cursor = offset;
++  let operandSize = false;
++  let addressSize = false;
++  let rexW = false;
++  let rexB = false;
++  let rexX = false;
++
++  // Legacy prefixes, then REX. Anything else ends the prefix run.
++  for (;;) {
++    const byte = code[cursor];
++    if (byte === undefined) throw new Error("instruction runs past the buffer");
++
++    if (byte === 0x66) {
++      operandSize = true;
++    } else if (byte === 0x67) {
++      addressSize = true;
++    } else if (
++      byte === 0xf0 || byte === 0xf2 || byte === 0xf3 ||
++      byte === 0x2e || byte === 0x36 || byte === 0x3e ||
++      byte === 0x26 || byte === 0x64 || byte === 0x65
++    ) {
++      // lock, rep, segment overrides: no effect on length
++    } else if (byte >= 0x40 && byte <= 0x4f) {
++      rexW = (byte & 0x08) !== 0;
++      rexX = (byte & 0x02) !== 0;
++      rexB = (byte & 0x01) !== 0;
++      cursor++;
++      break; // REX must be the last prefix
++    } else {
++      break;
++    }
++    cursor++;
++  }
++
++  let opcode = code[cursor++];
++  let indirect: Decoded["indirect"];
++  let hasModRM: boolean;
++  let immediate: Imm = Imm.None;
++  let endsBlock = false;
++
++  if (opcode === 0x0f) {
++    const second = code[cursor++];
++
++    if (second === 0x38 || second === 0x3a) {
++      // Three-byte opcodes: always ModRM, 0x3a adds an imm8.
++      cursor++;
++      hasModRM = true;
++      if (second === 0x3a) immediate = Imm.Byte;
++    } else {
++      hasModRM = !TWO_BYTE_NO_MODRM.has(second);
++
++      if (second >= 0x80 && second <= 0x8f) {
++        // Jcc rel32 carries no ModRM; counting one shifts every later
++        // boundary by a byte.
++        hasModRM = false;
++        immediate = Imm.Zed;
++        endsBlock = true;
++      } else if (
++        // pshuf* and the SSE compares
++        second === 0x70 || second === 0xc2 || second === 0xc4 ||
++        second === 0xc5 || second === 0xc6 ||
++        // shift groups 12 to 14, taking a count byte
++        second === 0x71 || second === 0x72 || second === 0x73 ||
++        // bit test group 8
++        second === 0xba ||
++        // SHLD and SHRD by an immediate; the guest's obfuscation is full of
++        // these and a missed byte here shifts every later boundary
++        second === 0xa4 || second === 0xac
++      ) {
++        immediate = Imm.Byte;
++      } else if (second === 0x05 || second === 0x0b) {
++        endsBlock = true; // SYSCALL, UD2
++      }
++    }
++    opcode = -1;
++  } else {
++    hasModRM = ONE_BYTE_MODRM[opcode] === 1;
++    immediate = ONE_BYTE_IMMEDIATE[opcode] as Imm;
++
++    endsBlock =
++      (opcode >= 0x70 && opcode <= 0x7f) || // Jcc rel8
++      opcode === 0xc2 || opcode === 0xc3 || // RET
++      opcode === 0xca || opcode === 0xcb ||
++      opcode === 0xcc || opcode === 0xcd || opcode === 0xce || // INT
++      opcode === 0xcf || // IRET
++      (opcode >= 0xe0 && opcode <= 0xe3) || // LOOP/JCXZ
++      opcode === 0xe8 || opcode === 0xe9 || opcode === 0xeb || // CALL/JMP
++      opcode === 0xf1 || opcode === 0xf4; // INT1, HLT
++  }
++
++  if (hasModRM) {
++    const modrm = code[cursor++];
++    if (modrm === undefined) throw new Error("ModRM runs past the buffer");
++
++    const mod = modrm >> 6;
++    const rm = modrm & 0x07;
++
++    let sibByte: number | null = null;
++    let displacement = 0;
++    let displacementAt = -1;
++
++    if (mod !== 3) {
++      if (addressSize) {
++        // 16-bit addressing: only mod 0 with rm 6 carries a displacement.
++        if (mod === 1) cursor += 1;
++        else if (mod === 2 || (mod === 0 && rm === 6)) cursor += 2;
++      } else {
++        if (rm === 4) {
++          sibByte = code[cursor++];
++          if (sibByte === undefined) throw new Error("SIB runs past the buffer");
++          // A base of 5 with mod 0 means a 32-bit displacement instead.
++          if (mod === 0 && (sibByte & 0x07) === 5) {
++            displacementAt = cursor;
++            cursor += 4;
++          }
++        }
++        if (mod === 1) {
++          displacementAt = cursor;
++          cursor += 1;
++        } else if (mod === 2) {
++          displacementAt = cursor;
++          cursor += 4;
++        } else if (mod === 0 && rm === 5) {
++          displacementAt = cursor; // RIP-relative
++          cursor += 4;
++        }
++      }
++    }
++
++    // FF /2 and /3 are indirect CALL, /4 and /5 indirect JMP.
++    if (opcode === 0xff) {
++      const reg = (modrm >> 3) & 0x07;
++      if (reg >= 2 && reg <= 5) {
++        endsBlock = true;
++
++        const view = new DataView(code.buffer, code.byteOffset, code.byteLength);
++        if (displacementAt >= 0) {
++          displacement =
++            mod === 1 ? view.getInt8(displacementAt) : view.getInt32(displacementAt, true);
++        }
++
++        if (mod === 3) {
++          indirect = {
++            base: null, index: null, scale: 1, displacement: 0,
++            ripRelative: false, register: rm | (rexB ? 8 : 0),
++          };
++        } else if (sibByte !== null) {
++          const scale = 1 << (sibByte >> 6);
++          const indexReg = ((sibByte >> 3) & 0x07) | (rexX ? 8 : 0);
++          const baseReg = (sibByte & 0x07) | (rexB ? 8 : 0);
++          indirect = {
++            // Index 4 without REX.X encodes "no index".
++            index: indexReg === 4 ? null : indexReg,
++            base: mod === 0 && (sibByte & 0x07) === 5 ? null : baseReg,
++            scale, displacement, ripRelative: false, register: null,
++          };
++        } else {
++          indirect = {
++            base: mod === 0 && rm === 5 ? null : rm | (rexB ? 8 : 0),
++            index: null, scale: 1, displacement,
++            ripRelative: mod === 0 && rm === 5,
++            register: null,
++          };
++        }
++      }
++    }
++
++    // Group 3: TEST under F6/F7 carries an immediate, the rest do not.
++    if (opcode === 0xf6 || opcode === 0xf7) {
++      const reg = (modrm >> 3) & 0x07;
++      immediate = reg <= 1 ? (opcode === 0xf6 ? Imm.Byte : Imm.Zed) : Imm.None;
++    }
++  }
++
++  switch (immediate) {
++    case Imm.Byte:
++      cursor += 1;
++      break;
++    case Imm.Word:
++      cursor += 2;
++      break;
++    case Imm.Zed:
++      cursor += operandSize ? 2 : 4;
++      break;
++    case Imm.Vee:
++      cursor += rexW ? 8 : operandSize ? 2 : 4;
++      break;
++    default:
++      break;
++  }
++
++  if (opcode === 0xc8) cursor += 1; // ENTER's trailing imm8
++
++  const length = cursor - offset;
++  if (length <= 0 || length > 15) {
++    throw new Error(`implausible instruction length ${length}`);
++  }
++
++  return {
++    length,
++    endsBlock,
++    relative: relativeTarget(code, offset, cursor),
++    indirect,
++  };
++}
++
++/** Displacement of a direct relative branch, measured from its end. */
++function relativeTarget(
++  code: Uint8Array,
++  offset: number,
++  end: number,
++): number | undefined {
++  const first = code[offset];
++
++  // Skip prefixes to find the opcode; only REX matters for these encodings.
++  let cursor = offset;
++  while (
++    code[cursor] === 0x66 || code[cursor] === 0x67 || code[cursor] === 0xf0 ||
++    code[cursor] === 0xf2 || code[cursor] === 0xf3 ||
++    (code[cursor] >= 0x40 && code[cursor] <= 0x4f)
++  ) {
++    cursor++;
++  }
++
++  const opcode = code[cursor];
++  const view = new DataView(code.buffer, code.byteOffset, code.byteLength);
++
++  if (opcode === 0xeb || (opcode >= 0x70 && opcode <= 0x7f)) {
++    return view.getInt8(cursor + 1);
++  }
++
++  if (opcode === 0xe8 || opcode === 0xe9) {
++    return view.getInt32(cursor + 1, true);
++  }
++
++  if (opcode === 0x0f && code[cursor + 1] >= 0x80 && code[cursor + 1] <= 0x8f) {
++    return view.getInt32(cursor + 2, true);
++  }
++
++  void first;
++  void end;
++  return undefined;
++}
++
++export interface Block {
++  /** Instructions up to and including the terminator, or up to `limit`. */
++  instructions: number;
++  /** Byte offset one past the last instruction counted. */
++  end: number;
++  /** False when the scan stopped at `limit` rather than at a terminator. */
++  complete: boolean;
++  /** The terminator and where it starts, when the block ended on its own. */
++  terminator?: { offset: number; decoded: Decoded };
++}
++
++/**
++ * Measures the basic block starting at `offset`, stopping at `limit`
++ * instructions if it has not ended by then.
++ */
++export function measureBlock(
++  code: Uint8Array,
++  offset: number,
++  limit: number,
++): Block {
++  let cursor = offset;
++
++  for (let index = 0; index < limit; index++) {
++    const start = cursor;
++    const decoded = decode(code, cursor);
++    cursor += decoded.length;
++
++    if (decoded.endsBlock) {
++      return {
++        instructions: index + 1,
++        end: cursor,
++        complete: true,
++        terminator: { offset: start, decoded },
++      };
++    }
++  }
++
++  return { instructions: limit, end: cursor, complete: false };
++}
+diff --git a/frontend/src/apple/sap/machine.ts b/frontend/src/apple/sap/machine.ts
+new file mode 100644
+index 0000000..cafc7e7
+--- /dev/null
++++ b/frontend/src/apple/sap/machine.ts
+@@ -0,0 +1,594 @@
++// The SAP guest machine.
++//
++// Ported from ipatool's internal/sap/machine/machine.go. Loads the three
++// CommerceKit images into an emulated x86-64 address space, wires the shim
++// area underneath them, and exposes the four entry points the SAP protocol
++// drives: initialize, exchange, sign and teardown.
++//
++// The entry points are obfuscated symbol names in the shipped binaries, so
++// they are looked up by those names rather than anything descriptive.
++
++import { Engine } from "./engine";
++import { type Block, type Decoded, measureBlock } from "./length";
++import { MachImage } from "./macho";
++import { registerPlatformServices } from "./platform";
++import { HEAP_BASE, HEAP_SIZE, Shims, align } from "./shims";
++
++const RETURN_ADDRESS = 0x0000000100000000n;
++const CORE_FP_BASE = 0x0000100000000000n;
++const COMMERCE_BASE = 0x0000100040000000n;
++const KIT_BASE = 0x0000100080000000n;
++const SCRATCH_BASE = 0x0000300000000000n;
++const SCRATCH_SIZE = 32n << 20n;
++const STACK_BASE = 0x0000500000000000n;
++const STACK_SIZE = 8n << 20n;
++const STACK_END = STACK_BASE + STACK_SIZE;
++const PAGE_SIZE = 0x1000n;
++const MAX_OUTPUT_SIZE = 16n << 20n;
++
++// ipatool bounds a guest call by both wall clock and instruction count. A
++// non-zero timeout makes Unicorn spawn a timer thread, which the WebAssembly
++// build cannot do ("qemu_thread_create: Not supported"), so the instruction
++// limit is the only bound here. It is the tighter of the two in practice.
++const EXECUTION_TIMEOUT_MICROS = 0n;
++const INSTRUCTION_LIMIT = 100_000_000;
++
++// unicorn.js aborts inside QEMU's Tiny Code Interpreter on a long basic
++// block, so long blocks are executed in pieces: a HLT is planted this far
++// ahead of the guest, and execution resumes from there once it stops.
++//
++// Synthetic blocks of one-byte instructions survive to eighty-eight, but the
++// guest's are wider and generate more interpreter operations each, so the
++// usable figure is lower. Measured over a full SAP setup: thirty-two works
++// and takes 63s, forty-eight works but takes 76s, sixty-four traps.
++const MAX_BLOCK_INSTRUCTIONS = 32;
++
++// Enough bytes to decode MAX_BLOCK_INSTRUCTIONS of any encoding.
++const CODE_WINDOW = MAX_BLOCK_INSTRUCTIONS * 15;
++
++const CORE_EXPORT_NAMES = [
++  "_WIn9UJ86JKdV4dM",
++  "_X46O5IeS",
++  "_YlCJ3lg",
++  "_dku592fbFAj",
++  "_fdjkDSAFjklaf2s",
++  "_lxpgvVMLd0S7uRl",
++];
++
++const ENTRY_NAMES = {
++  initialize: "_cp2g1b9ro",
++  exchange: "_Mib5yocT",
++  sign: "_Fc3vhtJDvr",
++  teardown: "_IPaI1oem5iL",
++  dispose: "_jEHf8Xzsv8K",
++} as const;
++
++export interface AssetBundle {
++  commerceKit: Uint8Array;
++  commerceCore: Uint8Array;
++  coreFP: Uint8Array;
++  coreFPICXS: Uint8Array;
++}
++
++interface EntryPoints {
++  initialize: bigint;
++  exchange: bigint;
++  sign: bigint;
++  teardown: bigint;
++  dispose: bigint;
++}
++
++export class Machine {
++  private readonly engine: Engine;
++  private readonly shims: Shims;
++  private readonly entry: EntryPoints;
++
++  private scratchCursor = 0n;
++  private closed = false;
++
++  private constructor(engine: Engine, shims: Shims, entry: EntryPoints) {
++    this.engine = engine;
++    this.shims = shims;
++    this.entry = entry;
++  }
++
++  static async open(bundle: AssetBundle): Promise<Machine> {
++    const coreFP = new MachImage("CoreFP", bundle.coreFP);
++    const commerceCore = new MachImage("CommerceCore", bundle.commerceCore);
++    const commerceKit = new MachImage("CommerceKit", bundle.commerceKit);
++
++    const exports = new Map<string, bigint>();
++    const coreExports = new Map<string, bigint>();
++
++    for (const name of CORE_EXPORT_NAMES) {
++      const address = coreFP.export(name, CORE_FP_BASE);
++      exports.set(name, address);
++      coreExports.set(name, address);
++    }
++
++    exports.set(
++      "_get_mac_address",
++      commerceCore.export("_get_mac_address", COMMERCE_BASE),
++    );
++
++    const entry = {} as EntryPoints;
++    for (const [role, symbol] of Object.entries(ENTRY_NAMES)) {
++      const address = commerceKit.export(symbol, KIT_BASE);
++      exports.set(symbol, address);
++      entry[role as keyof EntryPoints] = address;
++    }
++
++    const engine = await Engine.create();
++
++    for (const [address, size] of [
++      [RETURN_ADDRESS, PAGE_SIZE],
++      [SCRATCH_BASE, SCRATCH_SIZE],
++      [HEAP_BASE, HEAP_SIZE],
++      [STACK_BASE, STACK_SIZE],
++    ] as const) {
++      engine.memMap(address, size);
++    }
++
++    // A lone HLT the guest returns into, so a finished call stops the engine.
++    engine.memWrite(RETURN_ADDRESS, new Uint8Array([0xf4]));
++
++    const shims = new Shims(engine);
++    registerPlatformServices(shims, engine, coreExports, bundle.coreFPICXS);
++    shims.installHook();
++
++    const resolve = (name: string): bigint =>
++      exports.get(name) ?? shims.resolve(name);
++
++    for (const [image, base] of [
++      [coreFP, CORE_FP_BASE],
++      [commerceCore, COMMERCE_BASE],
++      [commerceKit, KIT_BASE],
++    ] as const) {
++      image.relocate(base, resolve);
++      image.load(engine);
++    }
++
++    return new Machine(engine, shims, entry);
++  }
++
++  /** Starts a SAP session for a hardware identity and returns its context. */
++  initialize(hardwareID: Uint8Array): bigint {
++    const hardware = hardwareBlock(hardwareID);
++    this.beginCall();
++
++    try {
++      const contextField = this.scratch(null, 8n);
++      const hardwareAddress = this.scratch(hardware, BigInt(hardware.length));
++
++      const status = this.invoke(this.entry.initialize, contextField, hardwareAddress);
++      if (asInt32(status) !== 0) {
++        throw new Error(`SAP initialization returned ${asInt32(status)}`);
++      }
++
++      const context = this.engine.readUint64(contextField);
++      if (context === 0n) {
++        throw new Error("SAP initialization returned a null context");
++      }
++
++      return context;
++    } finally {
++      this.clearScratch();
++    }
++  }
++
++  /** Drives one round of the SAP setup handshake. */
++  exchange(
++    version: number,
++    hardwareID: Uint8Array,
++    context: bigint,
++    input: Uint8Array,
++  ): { output: Uint8Array; state: number } {
++    const hardware = hardwareBlock(hardwareID);
++    this.beginCall();
++
++    try {
++      const hardwareAddress = this.scratch(hardware, BigInt(hardware.length));
++      const inputAddress = this.scratch(input, BigInt(input.length));
++      const outputField = this.scratch(null, 8n);
++      const lengthField = this.scratch(null, 8n);
++      const resultField = this.scratch(null, 4n);
++
++      const status = this.invoke(
++        this.entry.exchange,
++        BigInt(version),
++        hardwareAddress,
++        context,
++        inputAddress,
++        BigInt(input.length),
++        outputField,
++        lengthField,
++        resultField,
++      );
++      if (asInt32(status) !== 0) {
++        throw new Error(`SAP exchange returned ${asInt32(status)}`);
++      }
++
++      const output = this.consumeOutput(outputField, lengthField);
++      return { output, state: this.engine.readUint32(resultField) | 0 };
++    } finally {
++      this.clearScratch();
++    }
++  }
++
++  /** Signs a request payload once setup has completed. */
++  sign(context: bigint, input: Uint8Array): Uint8Array {
++    this.beginCall();
++
++    try {
++      const inputAddress = this.scratch(input, BigInt(input.length));
++      const outputField = this.scratch(null, 8n);
++      const lengthField = this.scratch(null, 8n);
++
++      const status = this.invoke(
++        this.entry.sign,
++        context,
++        inputAddress,
++        BigInt(input.length),
++        outputField,
++        lengthField,
++      );
++      if (asInt32(status) !== 0) {
++        throw new Error(`SAP signing returned ${asInt32(status)}`);
++      }
++
++      return this.consumeOutput(outputField, lengthField);
++    } finally {
++      this.clearScratch();
++    }
++  }
++
++  teardown(context: bigint): void {
++    const status = this.invoke(this.entry.teardown, context);
++    if (asInt32(status) !== 0) {
++      throw new Error(`SAP teardown returned ${asInt32(status)}`);
++    }
++  }
++
++  close(): void {
++    if (this.closed) return;
++    this.closed = true;
++    this.engine.close();
++  }
++
++  /** Reports each guest service call; see Shims.trace. */
++  setTrace(trace: ((name: string) => void) | null): void {
++    this.shims.trace = trace;
++  }
++
++  /**
++   * Reports every instruction the guest reaches. Very slow, and only useful
++   * for finding where a run goes wrong: the guest is an opaque binary and
++   * this build reports an invalid opcode as a module trap with no address.
++   */
++  traceInstructions(callback: (address: bigint) => void): void {
++    this.engine.addCodeHook(1n, 0n, callback);
++  }
++
++  /** Reads a register by the names Engine exposes, for diagnostics. */
++  register(name: "rax" | "rdi" | "rsi" | "rsp" | "rip"): bigint {
++    const map = {
++      rax: this.engine.regRAX,
++      rdi: this.engine.regRDI,
++      rsi: this.engine.regRSI,
++      rsp: this.engine.regRSP,
++      rip: this.engine.regRIP,
++    };
++    return this.engine.regRead(map[name]);
++  }
++
++  /** Reports guest accesses to unmapped memory; see Engine.addUnmappedHook. */
++  setUnmappedTrace(
++    trace: (kind: string, address: bigint, size: number) => void,
++  ): void {
++    this.engine.addUnmappedHook(trace);
++  }
++
++  /** Reads guest memory. For diagnosing a run against the Go implementation. */
++  peek(address: bigint, size: number): Uint8Array {
++    return this.engine.memRead(address, size);
++  }
++
++  entryPoints(): Readonly<EntryPoints> {
++    return this.entry;
++  }
++
++  // ---- guest calls --------------------------------------------------------
++
++  private invoke(func: bigint, ...args: bigint[]): bigint {
++    if (this.closed) throw new Error("SAP guest machine is closed");
++    if (func === 0n) throw new Error("SAP guest entry point is unavailable");
++
++    const registers = [
++      this.engine.regRDI,
++      this.engine.regRSI,
++      this.engine.regRDX,
++      this.engine.regRCX,
++      this.engine.regR8,
++      this.engine.regR9,
++    ];
++
++    for (let index = 0; index < registers.length; index++) {
++      this.engine.regWrite(registers[index], args[index] ?? 0n);
++    }
++
++    const extra = Math.max(args.length - registers.length, 0);
++
++    // The System V ABI wants RSP+8 to be 16-byte aligned at the entry point,
++    // which after the pushed return address means RSP % 16 == 8.
++    let stackPointer = STACK_END - BigInt(extra + 1) * 8n;
++    if (stackPointer % 16n !== 8n) stackPointer -= 8n;
++
++    this.engine.writeUint64(stackPointer, RETURN_ADDRESS);
++    for (let index = 0; index < extra; index++) {
++      this.engine.writeUint64(
++        stackPointer + 8n + BigInt(index) * 8n,
++        args[registers.length + index],
++      );
++    }
++    this.engine.regWrite(this.engine.regRSP, stackPointer);
++
++    this.shims.resetFault();
++
++    try {
++      this.run(func);
++    } catch (error) {
++      if (this.shims.fault) throw this.shims.fault;
++      throw new Error(
++        `execute SAP guest function: ${error instanceof Error ? error.message : String(error)}`,
++      );
++    }
++
++    if (this.shims.fault) throw this.shims.fault;
++
++    const instruction = this.engine.regRead(this.engine.regRIP);
++    if (instruction !== RETURN_ADDRESS) {
++      throw new Error(`SAP guest stopped unexpectedly at 0x${instruction.toString(16)}`);
++    }
++
++    return this.engine.regRead(this.engine.regRAX);
++  }
++
++  /**
++   * Runs the guest from `start` until it returns to the trampoline, splitting
++   * any basic block that would exceed what unicorn.js can translate.
++   *
++   * The split is transparent to the guest: a HLT replaces one byte, execution
++   * stops on it with RIP at that address, the original byte goes back, and
++   * execution resumes from the same place. Only the emulator notices, and only
++   * by translating a shorter block.
++   */
++  private run(start: bigint): void {
++    let address = start;
++    let budget = INSTRUCTION_LIMIT;
++
++    while (budget > 0) {
++      const block = this.measure(address);
++
++      if (!block) {
++        // Undecodable: let the emulator run unassisted, which is no worse
++        // than not splitting at all.
++        this.segment(address, budget, null);
++        budget = 0;
++      } else if (!block.complete) {
++        // Too long to translate whole. Stop it at the last safe boundary and
++        // resume from there; the guest cannot tell, only the translator can.
++        this.segment(address, block.instructions, address + BigInt(block.end));
++        budget -= block.instructions;
++      } else {
++        // Run the body first, so the terminator executes on its own. Taking
++        // a branch also translates its target, so the target's block has to
++        // be made safe before the branch runs, not after.
++        const body = block.instructions - 1;
++        if (body > 0) {
++          this.segment(address, body, null);
++          budget -= body;
++        }
++
++        const terminator = address + BigInt(block.terminator!.offset);
++        const current = this.engine.regRead(this.engine.regRIP);
++        if (current === RETURN_ADDRESS || this.shims.fault) return;
++        if (body > 0 && current !== terminator) {
++          address = current;
++          continue;
++        }
++
++        this.segment(terminator, 1, this.targetCut(block, address));
++        budget -= 1;
++      }
++
++      let next = this.engine.regRead(this.engine.regRIP);
++      if (next === RETURN_ADDRESS || this.shims.fault) return;
++
++      if (next === address) {
++        // A segment can legitimately stop where it started, for instance when
++        // the split point falls on the instruction about to run and the guard
++        // drops it. Step once unassisted to get past it.
++        this.segment(address, 1, null);
++        budget -= 1;
++
++        next = this.engine.regRead(this.engine.regRIP);
++        if (next === RETURN_ADDRESS || this.shims.fault) return;
++        if (next === address) {
++          throw new Error(`SAP guest made no progress at 0x${address.toString(16)}`);
++        }
++      }
++
++      address = next;
++    }
++
++    throw new Error("SAP guest exceeded its instruction budget");
++  }
++
++  /** Runs `count` instructions from `address`, with `cut` held as a HLT. */
++  private segment(address: bigint, count: number, cut: bigint | null): void {
++    // A tight loop can put the split point on the very branch about to run —
++    // the back edge of a nine-instruction loop lands there whenever the limit
++    // is eight. Overwriting it would leave the tail of that branch stranded as
++    // its own instruction, so leave short blocks unsplit instead.
++    if (cut !== null && cut >= address && cut < address + 16n) {
++      cut = null;
++    }
++
++    let original = 0;
++    if (cut !== null) {
++      original = this.engine.memRead(cut, 1)[0];
++      this.engine.memWrite(cut, new Uint8Array([0xf4]));
++    }
++
++    try {
++      this.engine.start(address, RETURN_ADDRESS, EXECUTION_TIMEOUT_MICROS, count);
++    } finally {
++      if (cut !== null) this.engine.memWrite(cut, new Uint8Array([original]));
++    }
++  }
++
++  /**
++   * Where to plant a HLT so the block a terminator jumps into is safe to
++   * translate, or null when the target is unknown or already short.
++   *
++   * Direct branches carry their displacement; a return reads its target off
++   * the stack. Indirect branches would need the effective address evaluated,
++   * so they go unhandled and rely on their target being short.
++   */
++  private targetCut(block: Block, base: bigint): bigint | null {
++    const { offset, decoded } = block.terminator!;
++    const address = base + BigInt(offset);
++
++    let target: bigint;
++    try {
++      if (decoded.relative !== undefined) {
++        target = address + BigInt(decoded.length + decoded.relative);
++      } else if (decoded.indirect) {
++        const resolved = this.indirectTarget(decoded, address);
++        if (resolved === null) return null;
++        target = resolved;
++      } else if (this.engine.memRead(address, 1)[0] === 0xc3) {
++        target = this.engine.readUint64(this.engine.regRead(this.engine.regRSP));
++      } else {
++        return null;
++      }
++    } catch {
++      return null;
++    }
++
++    const measured = this.measure(target);
++    return measured && !measured.complete ? target + BigInt(measured.end) : null;
++  }
++
++  /** Evaluates the destination of an indirect call or jump. */
++  private indirectTarget(decoded: Decoded, address: bigint): bigint | null {
++    const form = decoded.indirect!;
++    if (form.register !== null) return this.engine.gpr(form.register);
++
++    let effective = BigInt(form.displacement);
++
++    if (form.ripRelative) {
++      effective += address + BigInt(decoded.length);
++    } else {
++      if (form.base !== null) effective += this.engine.gpr(form.base);
++      if (form.index !== null) {
++        effective += this.engine.gpr(form.index) * BigInt(form.scale);
++      }
++    }
++
++    return this.engine.readUint64(effective & ((1n << 64n) - 1n));
++  }
++
++  /**
++   * Measures the block at `address`, or null when its code cannot be read or
++   * decoded — in which case the caller falls back to letting the emulator run
++   * unassisted, which is no worse than not splitting at all.
++   */
++  private measure(address: bigint): Block | null {
++    try {
++      const window = this.engine.memRead(address, CODE_WINDOW);
++      return measureBlock(window, 0, MAX_BLOCK_INSTRUCTIONS);
++    } catch {
++      return null;
++    }
++  }
++
++  private beginCall(): void {
++    this.scratchCursor = 0n;
++  }
++
++  /** Bump allocator for one call's arguments and output slots. */
++  private scratch(data: Uint8Array | null, size: bigint): bigint {
++    const reserved = align(size > 1n ? size : 1n, 16n);
++    if (this.scratchCursor > SCRATCH_SIZE || reserved > SCRATCH_SIZE - this.scratchCursor) {
++      throw new Error("SAP guest scratch space exhausted");
++    }
++
++    const address = SCRATCH_BASE + this.scratchCursor;
++    this.scratchCursor += reserved;
++
++    if (data && data.length !== 0) {
++      if (BigInt(data.length) > size) {
++        throw new Error("scratch data exceeds reservation");
++      }
++      this.engine.memWrite(address, data);
++    } else if (size !== 0n) {
++      this.engine.memZero(address, Number(size));
++    }
++
++    return address;
++  }
++
++  private clearScratch(): void {
++    if (this.scratchCursor !== 0n && !this.closed) {
++      this.engine.memZero(SCRATCH_BASE, Number(this.scratchCursor));
++    }
++    this.scratchCursor = 0n;
++  }
++
++  /** Reads a guest-allocated buffer, then hands it back to the guest. */
++  private consumeOutput(pointerField: bigint, lengthField: bigint): Uint8Array {
++    const pointer = this.engine.readUint64(pointerField);
++    const length = this.engine.readUint64(lengthField);
++
++    let output = new Uint8Array(0);
++    let failure: Error | null = null;
++
++    if (length > MAX_OUTPUT_SIZE) {
++      failure = new Error(`SAP output is ${length} bytes, maximum is ${MAX_OUTPUT_SIZE}`);
++    } else if (length !== 0n) {
++      if (pointer === 0n) {
++        failure = new Error("SAP returned a null output pointer");
++      } else {
++        output = new Uint8Array(this.engine.memRead(pointer, Number(length)));
++      }
++    }
++
++    if (pointer !== 0n) {
++      const status = this.invoke(this.entry.dispose, pointer);
++      if (asInt32(status) !== 0 && !failure) {
++        failure = new Error(`SAP dispose returned ${asInt32(status)}`);
++      }
++    }
++
++    if (failure) throw failure;
++    return output;
++  }
++}
++
++/** The guest expects a length-prefixed hardware identity in a 24-byte block. */
++function hardwareBlock(hardwareID: Uint8Array): Uint8Array {
++  if (hardwareID.length === 0 || hardwareID.length > 20) {
++    throw new Error("hardware ID must contain between 1 and 20 bytes");
++  }
++
++  const result = new Uint8Array(24);
++  new DataView(result.buffer).setUint32(0, hardwareID.length, true);
++  result.set(hardwareID, 4);
++
++  return result;
++}
++
++function asInt32(value: bigint): number {
++  return Number(BigInt.asIntN(32, value));
++}
+diff --git a/frontend/src/apple/sap/macho.ts b/frontend/src/apple/sap/macho.ts
+new file mode 100644
+index 0000000..f86484d
+--- /dev/null
++++ b/frontend/src/apple/sap/macho.ts
+@@ -0,0 +1,556 @@
++// Minimal Mach-O loader for the SAP guest images.
++//
++// Ported from ipatool's internal/sap/machimage. Only what those three images
++// need is implemented: the x86-64 slice of a universal binary, LC_SEGMENT_64,
++// LC_SYMTAB lookups, and the LC_DYLD_INFO rebase and bind opcode streams.
++//
++// The Go original leans on go-macho for the opcode walk and reports each
++// rebase with the pointer already read out of the file. Reading that pointer
++// directly here is equivalent and removes the need to mirror go-macho's
++// structures, so the walk only has to yield (segment, offset) pairs.
++
++const FAT_MAGIC = 0xcafebabe;
++const MH_MAGIC_64 = 0xfeedfacf;
++const CPU_TYPE_X86_64 = 0x01000007;
++
++const LC_SEGMENT_64 = 0x19;
++const LC_SYMTAB = 0x02;
++const LC_DYLD_INFO = 0x22;
++const LC_DYLD_INFO_ONLY = 0x80000022;
++
++const REBASE_TYPE_POINTER = 1;
++const BIND_TYPE_POINTER = 1;
++
++const REBASE_OPCODE_MASK = 0xf0;
++const REBASE_IMMEDIATE_MASK = 0x0f;
++const REBASE_OPCODE_DONE = 0x00;
++const REBASE_OPCODE_SET_TYPE_IMM = 0x10;
++const REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB = 0x20;
++const REBASE_OPCODE_ADD_ADDR_ULEB = 0x30;
++const REBASE_OPCODE_ADD_ADDR_IMM_SCALED = 0x40;
++const REBASE_OPCODE_DO_REBASE_IMM_TIMES = 0x50;
++const REBASE_OPCODE_DO_REBASE_ULEB_TIMES = 0x60;
++const REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB = 0x70;
++const REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB = 0x80;
++
++const BIND_OPCODE_MASK = 0xf0;
++const BIND_IMMEDIATE_MASK = 0x0f;
++const BIND_OPCODE_DONE = 0x00;
++const BIND_OPCODE_SET_DYLIB_ORDINAL_IMM = 0x10;
++const BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB = 0x20;
++const BIND_OPCODE_SET_DYLIB_SPECIAL_IMM = 0x30;
++const BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM = 0x40;
++const BIND_OPCODE_SET_TYPE_IMM = 0x50;
++const BIND_OPCODE_SET_ADDEND_SLEB = 0x60;
++const BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB = 0x70;
++const BIND_OPCODE_ADD_ADDR_ULEB = 0x80;
++const BIND_OPCODE_DO_BIND = 0x90;
++const BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB = 0xa0;
++const BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED = 0xb0;
++const BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB = 0xc0;
++
++// Segment offsets are uint64 in the original, and linkers lean on that: a
++// backward jump is emitted as a ULEB that wraps, e.g. 0xfffffffffffff6c8 for
++// -0x938. BigInt has no width, so every offset step masks back to 64 bits.
++const U64_MASK = (1n << 64n) - 1n;
++
++const POINTER_SIZE = 8n;
++const PAGE_SIZE = 0x1000n;
++const MAX_IMAGE_SPAN = 1n << 30n;
++
++export interface GuestMemory {
++  memMap(address: bigint, size: bigint): void;
++  memWrite(address: bigint, data: Uint8Array): void;
++}
++
++interface Segment {
++  name: string;
++  address: bigint;
++  size: bigint;
++  fileOff: bigint;
++  fileSize: bigint;
++}
++
++interface Fixup {
++  segment: number;
++  offset: bigint;
++}
++
++interface Bind extends Fixup {
++  name: string;
++  addend: bigint;
++  type: number;
++}
++
++/** Reads the little-endian primitives the Mach-O structures are made of. */
++class Cursor {
++  private readonly view: DataView;
++  private offset: number;
++
++  constructor(view: DataView, start = 0) {
++    this.view = view;
++    this.offset = start;
++  }
++
++  get position(): number {
++    return this.offset;
++  }
++
++  atEnd(limit: number): boolean {
++    return this.offset >= limit;
++  }
++
++  u8(): number {
++    return this.view.getUint8(this.offset++);
++  }
++
++  u32(): number {
++    const value = this.view.getUint32(this.offset, true);
++    this.offset += 4;
++    return value;
++  }
++
++  u64(): bigint {
++    const value = this.view.getBigUint64(this.offset, true);
++    this.offset += 8;
++    return value;
++  }
++
++  /** LEB128, as used throughout the dyld opcode streams. */
++  uleb(): bigint {
++    let result = 0n;
++    let shift = 0n;
++    for (;;) {
++      const byte = this.u8();
++      result |= BigInt(byte & 0x7f) << shift;
++      if ((byte & 0x80) === 0) return result;
++      shift += 7n;
++      if (shift > 70n) throw new Error("ULEB128 value is too large");
++    }
++  }
++
++  sleb(): bigint {
++    let result = 0n;
++    let shift = 0n;
++    for (;;) {
++      const byte = this.u8();
++      result |= BigInt(byte & 0x7f) << shift;
++      shift += 7n;
++      if ((byte & 0x80) === 0) {
++        if (byte & 0x40) result -= 1n << shift;
++        return result;
++      }
++      if (shift > 70n) throw new Error("SLEB128 value is too large");
++    }
++  }
++
++  cstring(): string {
++    let text = "";
++    for (;;) {
++      const byte = this.u8();
++      if (byte === 0) return text;
++      text += String.fromCharCode(byte);
++    }
++  }
++}
++
++function align(value: bigint, boundary: bigint): bigint {
++  const remainder = value % boundary;
++  return remainder === 0n ? value : value + (boundary - remainder);
++}
++
++/** Picks the x86-64 member out of a universal binary, or passes a thin one through. */
++function amd64Slice(input: Uint8Array): Uint8Array {
++  if (input.length < 8) throw new Error("image is too small to be Mach-O");
++
++  const view = new DataView(input.buffer, input.byteOffset, input.byteLength);
++  if (view.getUint32(0, false) !== FAT_MAGIC) return input;
++
++  const count = view.getUint32(4, false);
++  for (let index = 0; index < count; index++) {
++    const entry = 8 + index * 20;
++    const cpu = view.getUint32(entry, false);
++    if (cpu !== CPU_TYPE_X86_64) continue;
++
++    const offset = view.getUint32(entry + 8, false);
++    const size = view.getUint32(entry + 12, false);
++    if (offset + size > input.length) {
++      throw new Error("x86-64 slice exceeds input size");
++    }
++    return input.subarray(offset, offset + size);
++  }
++
++  throw new Error("universal binary has no x86-64 slice");
++}
++
++export class MachImage {
++  private readonly data: Uint8Array;
++  private readonly view: DataView;
++  private readonly segments: Segment[] = [];
++  private readonly symbols = new Map<string, bigint>();
++  private readonly rebases: Fixup[] = [];
++  private readonly binds: Bind[] = [];
++
++  readonly name: string;
++  readonly base: bigint;
++
++  private relocated = false;
++  private loadedBase = 0n;
++  private loadedSpan = 0n;
++
++  constructor(name: string, input: Uint8Array) {
++    this.name = name;
++    // subarray keeps the parent buffer alive, so copy the slice we keep.
++    this.data = new Uint8Array(amd64Slice(input));
++    this.view = new DataView(this.data.buffer);
++
++    if (this.view.getUint32(0, true) !== MH_MAGIC_64) {
++      throw new Error(`${name} is not a 64-bit Mach-O`);
++    }
++    if (this.view.getUint32(4, true) !== CPU_TYPE_X86_64) {
++      throw new Error(`${name} is not x86-64`);
++    }
++
++    this.parseLoadCommands();
++    this.base = this.textBase();
++    this.validateSegments();
++  }
++
++  private parseLoadCommands(): void {
++    const count = this.view.getUint32(16, true);
++    let offset = 32;
++
++    for (let index = 0; index < count; index++) {
++      const command = this.view.getUint32(offset, true);
++      const size = this.view.getUint32(offset + 4, true);
++      if (size === 0) throw new Error(`${this.name} has a zero-length load command`);
++
++      if (command === LC_SEGMENT_64) {
++        this.parseSegment(offset);
++      } else if (command === LC_SYMTAB) {
++        this.parseSymtab(offset);
++      } else if (command === LC_DYLD_INFO || command === LC_DYLD_INFO_ONLY) {
++        this.parseDyldInfo(offset);
++      }
++
++      offset += size;
++    }
++  }
++
++  private parseSegment(offset: number): void {
++    let name = "";
++    for (let index = 0; index < 16; index++) {
++      const byte = this.view.getUint8(offset + 8 + index);
++      if (byte === 0) break;
++      name += String.fromCharCode(byte);
++    }
++
++    this.segments.push({
++      name,
++      address: this.view.getBigUint64(offset + 24, true),
++      size: this.view.getBigUint64(offset + 32, true),
++      fileOff: this.view.getBigUint64(offset + 40, true),
++      fileSize: this.view.getBigUint64(offset + 48, true),
++    });
++  }
++
++  private parseSymtab(offset: number): void {
++    const symbolOffset = this.view.getUint32(offset + 8, true);
++    const symbolCount = this.view.getUint32(offset + 12, true);
++    const stringOffset = this.view.getUint32(offset + 16, true);
++    const stringSize = this.view.getUint32(offset + 20, true);
++
++    for (let index = 0; index < symbolCount; index++) {
++      const entry = symbolOffset + index * 16;
++      if (entry + 16 > this.data.length) break;
++
++      const nameOffset = this.view.getUint32(entry, true);
++      const type = this.view.getUint8(entry + 4);
++      const value = this.view.getBigUint64(entry + 8, true);
++
++      // N_STAB entries are debug symbols; N_TYPE must be N_SECT to have an
++      // address worth resolving.
++      if (type & 0xe0) continue;
++      if ((type & 0x0e) !== 0x0e) continue;
++      if (nameOffset === 0 || nameOffset >= stringSize) continue;
++
++      let symbol = "";
++      let cursor = stringOffset + nameOffset;
++      while (cursor < this.data.length) {
++        const byte = this.data[cursor++];
++        if (byte === 0) break;
++        symbol += String.fromCharCode(byte);
++      }
++
++      if (symbol && !this.symbols.has(symbol)) this.symbols.set(symbol, value);
++    }
++  }
++
++  private parseDyldInfo(offset: number): void {
++    const rebaseOff = this.view.getUint32(offset + 8, true);
++    const rebaseSize = this.view.getUint32(offset + 12, true);
++    const bindOff = this.view.getUint32(offset + 16, true);
++    const bindSize = this.view.getUint32(offset + 20, true);
++    const weakBindOff = this.view.getUint32(offset + 24, true);
++    const weakBindSize = this.view.getUint32(offset + 28, true);
++    const lazyBindOff = this.view.getUint32(offset + 32, true);
++    const lazyBindSize = this.view.getUint32(offset + 36, true);
++
++    if (rebaseSize > 0) this.walkRebase(rebaseOff, rebaseOff + rebaseSize);
++    if (bindSize > 0) this.walkBind(bindOff, bindOff + bindSize, false);
++    if (weakBindSize > 0) this.walkBind(weakBindOff, weakBindOff + weakBindSize, false);
++    if (lazyBindSize > 0) this.walkBind(lazyBindOff, lazyBindOff + lazyBindSize, true);
++  }
++
++  private walkRebase(start: number, end: number): void {
++    const cursor = new Cursor(this.view, start);
++    let type = 0;
++    let segment = 0;
++    let offset = 0n;
++
++    const emit = (count: bigint, skip: bigint) => {
++      for (let index = 0n; index < count; index++) {
++        if (type !== REBASE_TYPE_POINTER) {
++          throw new Error(`${this.name} uses unsupported rebase type ${type}`);
++        }
++        this.rebases.push({ segment, offset });
++        offset = (offset + POINTER_SIZE + skip) & U64_MASK;
++      }
++    };
++
++    while (!cursor.atEnd(end)) {
++      const byte = cursor.u8();
++      const opcode = byte & REBASE_OPCODE_MASK;
++      const immediate = byte & REBASE_IMMEDIATE_MASK;
++
++      switch (opcode) {
++        case REBASE_OPCODE_DONE:
++          return;
++        case REBASE_OPCODE_SET_TYPE_IMM:
++          type = immediate;
++          break;
++        case REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
++          segment = immediate;
++          offset = cursor.uleb() & U64_MASK;
++          break;
++        case REBASE_OPCODE_ADD_ADDR_ULEB:
++          offset = (offset + cursor.uleb()) & U64_MASK;
++          break;
++        case REBASE_OPCODE_ADD_ADDR_IMM_SCALED:
++          offset = (offset + BigInt(immediate) * POINTER_SIZE) & U64_MASK;
++          break;
++        case REBASE_OPCODE_DO_REBASE_IMM_TIMES:
++          emit(BigInt(immediate), 0n);
++          break;
++        case REBASE_OPCODE_DO_REBASE_ULEB_TIMES:
++          emit(cursor.uleb(), 0n);
++          break;
++        case REBASE_OPCODE_DO_REBASE_ADD_ADDR_ULEB: {
++          const skip = cursor.uleb();
++          emit(1n, skip);
++          break;
++        }
++        case REBASE_OPCODE_DO_REBASE_ULEB_TIMES_SKIPPING_ULEB: {
++          const count = cursor.uleb();
++          const skip = cursor.uleb();
++          emit(count, skip);
++          break;
++        }
++        default:
++          throw new Error(`${this.name} uses unknown rebase opcode ${opcode}`);
++      }
++    }
++  }
++
++  // A lazy stream uses DONE to separate one symbol's sequence from the next
++  // and runs to the end of its range; the regular and weak streams end at the
++  // first DONE, with padding after it that must not be parsed.
++  private walkBind(start: number, end: number, lazy: boolean): void {
++    const cursor = new Cursor(this.view, start);
++    // Lazy bind streams may omit SET_TYPE; dyld's default is a pointer bind.
++    let type = BIND_TYPE_POINTER;
++    let segment = 0;
++    let offset = 0n;
++    let addend = 0n;
++    let symbol = "";
++
++    const emit = (skip: bigint) => {
++      if (type !== BIND_TYPE_POINTER) {
++        throw new Error(`${this.name} uses unsupported bind type ${type} for ${symbol}`);
++      }
++      this.binds.push({ segment, offset, name: symbol, addend, type });
++      offset = (offset + POINTER_SIZE + skip) & U64_MASK;
++    };
++
++    while (!cursor.atEnd(end)) {
++      const byte = cursor.u8();
++      const opcode = byte & BIND_OPCODE_MASK;
++      const immediate = byte & BIND_IMMEDIATE_MASK;
++
++      switch (opcode) {
++        case BIND_OPCODE_DONE:
++          if (!lazy) return;
++          break;
++        case BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:
++        case BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:
++          break;
++        case BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:
++          cursor.uleb();
++          break;
++        case BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM:
++          symbol = cursor.cstring();
++          break;
++        case BIND_OPCODE_SET_TYPE_IMM:
++          type = immediate;
++          break;
++        case BIND_OPCODE_SET_ADDEND_SLEB:
++          addend = cursor.sleb();
++          break;
++        case BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:
++          segment = immediate;
++          offset = cursor.uleb() & U64_MASK;
++          break;
++        case BIND_OPCODE_ADD_ADDR_ULEB:
++          offset = (offset + cursor.uleb()) & U64_MASK;
++          break;
++        case BIND_OPCODE_DO_BIND:
++          emit(0n);
++          break;
++        case BIND_OPCODE_DO_BIND_ADD_ADDR_ULEB:
++          emit(cursor.uleb());
++          break;
++        case BIND_OPCODE_DO_BIND_ADD_ADDR_IMM_SCALED:
++          emit(BigInt(immediate) * POINTER_SIZE);
++          break;
++        case BIND_OPCODE_DO_BIND_ULEB_TIMES_SKIPPING_ULEB: {
++          const count = cursor.uleb();
++          const skip = cursor.uleb();
++          for (let index = 0n; index < count; index++) emit(skip);
++          break;
++        }
++        default:
++          throw new Error(`${this.name} uses unknown bind opcode ${opcode}`);
++      }
++    }
++  }
++
++  private textBase(): bigint {
++    for (const item of this.segments) {
++      if (item.name === "__TEXT") return item.address;
++    }
++    throw new Error(`${this.name} has no __TEXT segment`);
++  }
++
++  private validateSegments(): void {
++    for (const item of this.segments) {
++      if (item.fileSize > item.size) {
++        throw new Error(`segment ${item.name} file data exceeds its memory size in ${this.name}`);
++      }
++      if (item.fileOff + item.fileSize > BigInt(this.data.length)) {
++        throw new Error(`segment ${item.name} data exceeds ${this.name}`);
++      }
++    }
++  }
++
++  /** File offset of a fixup, with the same bounds checks as the Go original. */
++  private segmentFileOffset(index: number, offset: bigint, size: bigint): bigint {
++    const item = this.segments[index];
++    if (!item) {
++      throw new Error(`fixup references unknown segment ${index} in ${this.name}`);
++    }
++
++    const end = offset + size;
++    if (end > item.size) {
++      throw new Error(`fixup at ${offset} exceeds segment ${item.name} in ${this.name}`);
++    }
++    if (end > item.fileSize) {
++      throw new Error(`fixup at ${offset} exceeds file data for segment ${item.name} in ${this.name}`);
++    }
++
++    return item.fileOff + offset;
++  }
++
++  private putPointer(offset: bigint, value: bigint): void {
++    this.view.setBigUint64(Number(offset), value, true);
++  }
++
++  /** Absolute guest address of an exported symbol once loaded at loadBase. */
++  export(name: string, loadBase: bigint): bigint {
++    const address = this.symbols.get(name);
++    if (address === undefined) {
++      throw new Error(`find ${name} in ${this.name}`);
++    }
++    if (address < this.base) {
++      throw new Error(`symbol ${name} in ${this.name} precedes image base`);
++    }
++    return loadBase + (address - this.base);
++  }
++
++  /** Applies rebases and binds in place, exactly as machimage.Relocate does. */
++  relocate(loadBase: bigint, resolve: (symbol: string) => bigint): void {
++    if (this.relocated) {
++      throw new Error(`${this.name} is already relocated`);
++    }
++
++    for (const item of this.rebases) {
++      const offset = this.segmentFileOffset(item.segment, item.offset, POINTER_SIZE);
++      const original = this.view.getBigUint64(Number(offset), true);
++      if (original < this.base) {
++        throw new Error(`${this.name} contains a rebase below its image base`);
++      }
++      this.putPointer(offset, loadBase + (original - this.base));
++    }
++
++    for (const item of this.binds) {
++      const offset = this.segmentFileOffset(item.segment, item.offset, POINTER_SIZE);
++      this.putPointer(offset, resolve(item.name) + item.addend);
++    }
++
++    this.relocated = true;
++    this.loadedBase = loadBase;
++  }
++
++  /** Maps the image span and writes every segment's file data into the guest. */
++  load(memory: GuestMemory): void {
++    if (!this.relocated) {
++      throw new Error(`${this.name} must be relocated before loading`);
++    }
++
++    let span = 0n;
++    for (const item of this.segments) {
++      if (item.name === "__PAGEZERO" || item.size === 0n) continue;
++      if (item.address < this.base) {
++        throw new Error(`segment ${item.name} in ${this.name} precedes image base`);
++      }
++
++      const end = item.address - this.base + item.size;
++      if (end > MAX_IMAGE_SPAN) {
++        throw new Error(`segment ${item.name} makes ${this.name} too large`);
++      }
++      if (end > span) span = end;
++    }
++
++    span = align(span, PAGE_SIZE);
++    if (span === 0n) {
++      throw new Error(`${this.name} has no loadable segments`);
++    }
++
++    memory.memMap(this.loadedBase, span);
++    this.loadedSpan = span;
++
++    for (const item of this.segments) {
++      if (item.name === "__PAGEZERO" || item.fileSize === 0n) continue;
++
++      const start = Number(item.fileOff);
++      const end = Number(item.fileOff + item.fileSize);
++      memory.memWrite(
++        this.loadedBase + (item.address - this.base),
++        this.data.subarray(start, end),
++      );
++    }
++  }
++
++  loadedRange(): { base: bigint; span: bigint } {
++    return { base: this.loadedBase, span: this.loadedSpan };
++  }
++}
+diff --git a/frontend/src/apple/sap/platform.ts b/frontend/src/apple/sap/platform.ts
+new file mode 100644
+index 0000000..f2359f9
+--- /dev/null
++++ b/frontend/src/apple/sap/platform.ts
+@@ -0,0 +1,271 @@
++// Platform services for the SAP guest.
++//
++// Ported from ipatool's internal/sap/machine/shim_platform.go. The guest is a
++// 2013 CommerceKit that expects macOS underneath it: CoreFoundation, IOKit,
++// dlopen, a filesystem. None of that exists here, so each import answers with
++// the least the signing path needs — usually a constant, sometimes a fake
++// handle the guest only ever passes back to another shim.
++//
++// The one import that carries real data is _read, which streams CoreFP.icxs
++// after the guest opens it by its relative path.
++
++import type { Engine } from "./engine";
++import type { Shims } from "./shims";
++
++const FAKE_HANDLE = (1n << 64n) - 1n;
++const UINT32_MAX = 0xffffffffn;
++const MINUS_ONE = (1n << 64n) - 1n;
++
++const CORE_FP_FILE = 3n;
++const CORE_FP_PATH = "/System/Library/PrivateFrameworks/CoreFP.framework/CoreFP";
++const ICXS_PATH = "./../CoreFP.icxs";
++
++const KEY_SERIAL = "IOPlatformSerialNumber";
++const KEY_UUID = "IOPlatformUUID";
++const KEY_BOARD = "board-id";
++const KEYED_MESSAGE = "objectForKey:";
++
++export function registerPlatformServices(
++  shims: Shims,
++  engine: Engine,
++  coreExports: Map<string, bigint>,
++  icxs: Uint8Array,
++): void {
++  // Guest state that outlives a single call.
++  let iterator = 0;
++  let icxsOffset = 0;
++
++  const returnZero = () => shims.setResult(0n);
++  const returnFakeHandle = () => shims.setResult(FAKE_HANDLE);
++  const returnMinusOne = () => shims.setResult(MINUS_ONE);
++
++  shims.addAliases(
++    [
++      "_CFBundleGetMainBundle",
++      "_CFDataGetBytePtr",
++      "_CFDataGetLength",
++      "_CFStringGetLength",
++      "_CFStringGetMaximumSizeForEncoding",
++      "_CFUUIDCreateString",
++      "_IORegistryEntryFromPath",
++      "_IORegistryEntrySearchCFProperty",
++      "_IOServiceMatching",
++      "_getenv",
++      "_pthread_self",
++    ],
++    returnZero,
++  );
++
++  shims.addAliases(
++    [
++      "_CFDictionaryGetValue",
++      "_DADiskCopyDescription",
++      "_DADiskCreateFromBSDName",
++      "_DASessionCreate",
++      "_IORegistryEntryCreateCFProperty",
++    ],
++    returnFakeHandle,
++  );
++
++  shims.addAliases(
++    [
++      "_CFRelease",
++      "_IOObjectRelease",
++      "_close",
++      "_close$UNIX2003",
++      "_pthread_mutex_lock",
++      "_pthread_mutex_unlock",
++      "_pthread_rwlock_init",
++      "_pthread_rwlock_init$UNIX2003",
++      "_pthread_rwlock_unlock",
++      "_pthread_rwlock_unlock$UNIX2003",
++      "_pthread_rwlock_wrlock",
++      "_pthread_rwlock_wrlock$UNIX2003",
++    ],
++    returnZero,
++  );
++
++  // Only the three hardware keys need to look real; everything else the guest
++  // asks CoreFoundation for can come back null.
++  shims.addAliases(["_CFStringCreateWithCString"], () => {
++    const value = shims.readCString(shims.argument(1));
++    const known = value === KEY_SERIAL || value === KEY_UUID || value === KEY_BOARD;
++    shims.setResult(known ? FAKE_HANDLE : 0n);
++  });
++
++  shims.addAliases(["_CFStringCreateWithCStringNoCopy"], returnZero);
++
++  shims.addAliases(["_CFStringGetCString"], () => {
++    const buffer = shims.argument(1);
++    const capacity = shims.argument(2);
++    if (buffer === 0n || capacity === 0n) {
++      shims.setResult(0n);
++      return;
++    }
++    engine.memWrite(buffer, new Uint8Array([0]));
++    shims.setResult(1n);
++  });
++
++  // The guest walks an IOKit iterator; yielding one entry then zero ends it.
++  shims.addAliases(["_IOIteratorNext"], () => {
++    iterator++;
++    shims.setResult(BigInt(iterator % 2));
++  });
++
++  shims.addAliases(["_IORegistryEntryGetParentEntry"], () => {
++    const parent = shims.argument(2);
++    if (parent === 0n) throw new Error("parent registry entry output is null");
++    engine.writeUint32(parent, Number(UINT32_MAX));
++    shims.setResult(0n);
++  });
++
++  shims.addAliases(["_IOServiceGetMatchingServices"], () => {
++    const output = shims.argument(2);
++    if (output === 0n) throw new Error("matching services iterator output is null");
++    iterator = 0;
++    engine.writeUint32(output, Number(UINT32_MAX));
++    shims.setResult(0n);
++  });
++
++  shims.addAliases(["_IOServiceGetMatchingService"], () => shims.setResult(UINT32_MAX));
++
++  shims.addAliases(["_OSAtomicCompareAndSwap32Barrier"], () => {
++    const oldValue = Number(shims.argument(0) & UINT32_MAX);
++    const newValue = Number(shims.argument(1) & UINT32_MAX);
++    const address = shims.argument(2);
++
++    if (engine.readUint32(address) !== oldValue) {
++      shims.setResult(0n);
++      return;
++    }
++    engine.writeUint32(address, newValue);
++    shims.setResult(1n);
++  });
++
++  shims.addAliases(["_abort", "___stack_chk_fail", "dyld_stub_binder"], () => {
++    throw new Error("guest aborted");
++  });
++
++  shims.addAliases(["_arc4random"], () => {
++    const value = new Uint32Array(1);
++    crypto.getRandomValues(value);
++    shims.setResult(BigInt(value[0]));
++  });
++
++  shims.addAliases(["_dlopen"], () => {
++    const path = shims.readCString(shims.argument(0));
++    shims.setResult(path === CORE_FP_PATH ? FAKE_HANDLE : 0n);
++  });
++
++  // The guest resolves CoreFP's own exports through dlsym; hand back the
++  // addresses the loader already resolved.
++  shims.addAliases(["_dlsym"], () => {
++    const name = shims.readCString(shims.argument(1));
++    shims.setResult(coreExports.get(`_${name}`) ?? 0n);
++  });
++
++  shims.addAliases(
++    ["_fcntl", "_fcntl$UNIX2003", "_lstat$INODE64", "_statfs", "_statfs$INODE64"],
++    returnMinusOne,
++  );
++
++  shims.addAliases(["_gettimeofday"], () => {
++    const timeAddress = shims.argument(0);
++    const zoneAddress = shims.argument(1);
++    const now = Date.now();
++
++    if (timeAddress !== 0n) {
++      const value = new Uint8Array(16);
++      const view = new DataView(value.buffer);
++      view.setBigUint64(0, BigInt(Math.floor(now / 1000)), true);
++      view.setUint32(8, (now % 1000) * 1000, true);
++      engine.memWrite(timeAddress, value);
++    }
++
++    if (zoneAddress !== 0n) engine.memZero(zoneAddress, 8);
++    shims.setResult(0n);
++  });
++
++  shims.addAliases(["_objc_msgSend"], () => {
++    const selector = shims.readCString(shims.argument(1));
++    shims.setResult(selector === KEYED_MESSAGE ? FAKE_HANDLE : 0n);
++  });
++
++  shims.addAliases(["_open", "_open$UNIX2003"], () => {
++    const path = shims.readCString(shims.argument(0));
++    if (path !== ICXS_PATH) {
++      returnMinusOne();
++      return;
++    }
++    icxsOffset = 0;
++    shims.setResult(CORE_FP_FILE);
++  });
++
++  // pthread_once has to actually run the initializer, so push it as a return
++  // address and let the guest fall into it when this shim's RET executes.
++  shims.addAliases(["_pthread_once"], () => {
++    const control = shims.argument(0);
++    const initializer = shims.argument(1);
++
++    if (engine.readUint64(control) === 0n) {
++      shims.setResult(0n);
++      return;
++    }
++
++    engine.writeUint64(control, 0n);
++
++    const stack = engine.regRead(engine.regRSP) - 8n;
++    engine.writeUint64(stack, initializer);
++    engine.regWrite(engine.regRSP, stack);
++    shims.setResult(0n);
++  });
++
++  shims.addAliases(["_read", "_read$UNIX2003"], () => {
++    const descriptor = shims.argument(0);
++    const buffer = shims.argument(1);
++    const requested = shims.argument(2);
++
++    if (descriptor !== CORE_FP_FILE) {
++      returnMinusOne();
++      return;
++    }
++
++    let size = Number(requested);
++    const remaining = icxs.length - icxsOffset;
++    if (size > remaining) size = remaining;
++
++    if (size !== 0) {
++      engine.memWrite(buffer, icxs.subarray(icxsOffset, icxsOffset + size));
++      icxsOffset += size;
++    }
++
++    shims.setResult(BigInt(size));
++  });
++
++  shims.addAliases(["_sysctl"], returnMinusOne);
++
++  shims.addAliases(["_sysctlbyname"], () => {
++    const lengthAddress = shims.argument(2);
++    if (lengthAddress !== 0n) engine.writeUint64(lengthAddress, 0n);
++    shims.setResult(0n);
++  });
++
++  // Data symbols. errno is read through ___error; the stack guard value is
++  // arbitrary but must stay put, since the guest compares it on return.
++  const errno = shims.addData("guest.errno", new Uint8Array(8));
++  shims.addAliases(["___error"], () => shims.setResult(errno));
++
++  shims.addData(
++    "___stack_chk_guard",
++    new Uint8Array([0xa5, 0x71, 0x3c, 0xd9, 0x86, 0x42, 0xef, 0x10]),
++  );
++
++  for (const name of [
++    "_kCFAllocatorDefault",
++    "_kCFAllocatorNull",
++    "_kDADiskDescriptionVolumeUUIDKey",
++    "_kIOMasterPortDefault",
++  ]) {
++    shims.addData(name, new Uint8Array(8));
++  }
++}
+diff --git a/frontend/src/apple/sap/shims.ts b/frontend/src/apple/sap/shims.ts
+new file mode 100644
+index 0000000..6b0fdad
+--- /dev/null
++++ b/frontend/src/apple/sap/shims.ts
+@@ -0,0 +1,424 @@
++// Guest service area for the SAP runtime.
++//
++// Ported from ipatool's internal/sap/machine/shims.go and shim_memory.go. The
++// guest images import around 500 symbols; only the ones the signing path
++// actually touches are implemented, and the rest get a stub that faults only
++// if the guest calls it.
++//
++// Each service is a 16-byte slot holding a single RET. A UC_HOOK_CODE over the
++// code area catches the entry, the handler runs on the host, and the RET
++// returns to the caller — so the guest never notices the call left the VM.
++
++import type { Engine } from "./engine";
++
++export const SHIM_BASE = 0x0000200000000000n;
++export const SHIM_CODE_SIZE = 0x0000000000080000n;
++export const SHIM_SIZE = 0x0000000000100000n;
++const SHIM_SLOT_SIZE = 16n;
++
++export const HEAP_BASE = 0x0000400000000000n;
++export const HEAP_SIZE = 64n << 20n;
++
++const MAX_GUEST_TRANSFER = 64n << 20n;
++const U64_MASK = (1n << 64n) - 1n;
++
++type ShimHandler = () => void;
++
++interface Allocation {
++  size: bigint;
++  reserved: bigint;
++}
++
++interface FreeBlock {
++  address: bigint;
++  size: bigint;
++}
++
++export function align(value: bigint, alignment: bigint): bigint {
++  return (value + alignment - 1n) & ~(alignment - 1n);
++}
++
++function maxBig(left: bigint, right: bigint): bigint {
++  return left > right ? left : right;
++}
++
++export class Shims {
++  private readonly engine: Engine;
++  private readonly entries = new Map<bigint, { name: string; handler: ShimHandler }>();
++  readonly symbols = new Map<string, bigint>();
++
++  private codeCursor = SHIM_BASE;
++  private dataCursor = SHIM_BASE + SHIM_CODE_SIZE;
++
++  private heapCursor = 0n;
++  private readonly allocations = new Map<bigint, Allocation>();
++  private freeBlocks: FreeBlock[] = [];
++
++  fault: Error | null = null;
++
++  /**
++   * Called with each service the guest enters. The guest is an opaque binary,
++   * so the call sequence is the only window into what it is doing when a run
++   * goes wrong.
++   */
++  trace: ((name: string) => void) | null = null;
++
++  constructor(engine: Engine) {
++    this.engine = engine;
++    this.engine.memMap(SHIM_BASE, SHIM_SIZE);
++    this.registerMemoryServices();
++  }
++
++  /** Called by the machine once every service group is registered. */
++  installHook(): void {
++    this.engine.addCodeHook(SHIM_BASE, SHIM_BASE + SHIM_CODE_SIZE - 1n, (address) => {
++      this.dispatch(address);
++    });
++  }
++
++  private dispatch(address: bigint): void {
++    const entry = this.entries.get(address);
++    if (!entry) {
++      this.fail(new Error(`guest entered unknown service address 0x${address.toString(16)}`));
++      return;
++    }
++
++    this.trace?.(entry.name);
++
++    try {
++      entry.handler();
++    } catch (error) {
++      this.fail(
++        new Error(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`),
++      );
++    }
++  }
++
++  fail(error: Error): void {
++    if (!this.fault) this.fault = error;
++    this.engine.stop();
++  }
++
++  resetFault(): void {
++    this.fault = null;
++  }
++
++  /** Reserves a slot holding a lone RET and remembers its handler. */
++  addFunction(name: string, handler: ShimHandler): bigint {
++    const existing = this.symbols.get(name);
++    if (existing !== undefined) return existing;
++
++    if (this.codeCursor + SHIM_SLOT_SIZE > SHIM_BASE + SHIM_CODE_SIZE) {
++      throw new Error("guest service code area is full");
++    }
++
++    const address = this.codeCursor;
++    this.codeCursor += SHIM_SLOT_SIZE;
++
++    this.engine.memWrite(address, new Uint8Array([0xc3]));
++    this.entries.set(address, { name, handler });
++    this.symbols.set(name, address);
++
++    return address;
++  }
++
++  addAliases(names: string[], handler: ShimHandler): void {
++    for (const name of names) this.addFunction(name, handler);
++  }
++
++  addData(name: string, data: Uint8Array): bigint {
++    const existing = this.symbols.get(name);
++    if (existing !== undefined) return existing;
++
++    this.dataCursor = align(this.dataCursor, 8n);
++    if (this.dataCursor + BigInt(data.length) > SHIM_BASE + SHIM_SIZE) {
++      throw new Error("guest service data area is full");
++    }
++
++    const address = this.dataCursor;
++    this.dataCursor += maxBig(BigInt(data.length), 8n);
++
++    this.engine.memWrite(address, data);
++    this.symbols.set(name, address);
++
++    return address;
++  }
++
++  /** Unknown imports resolve to a stub that only faults when entered. */
++  resolve(name: string): bigint {
++    const existing = this.symbols.get(name);
++    if (existing !== undefined) return existing;
++
++    return this.addFunction(name, () => {
++      throw new Error(`guest called unsupported import ${name}`);
++    });
++  }
++
++  // ---- calling convention -------------------------------------------------
++
++  argument(index: number): bigint {
++    const registers = [
++      this.engine.regRDI,
++      this.engine.regRSI,
++      this.engine.regRDX,
++      this.engine.regRCX,
++      this.engine.regR8,
++      this.engine.regR9,
++    ];
++
++    if (index < 0) throw new Error("negative guest argument index");
++    if (index < registers.length) return this.engine.regRead(registers[index]);
++
++    const stack = this.engine.regRead(this.engine.regRSP);
++    return this.engine.readUint64(stack + 8n + BigInt(index - registers.length) * 8n);
++  }
++
++  setResult(value: bigint): void {
++    this.engine.regWrite(this.engine.regRAX, value & U64_MASK);
++  }
++
++  readCString(address: bigint): string {
++    const maximum = 4096;
++    let text = "";
++    for (let offset = 0; offset < maximum; offset++) {
++      const byte = this.engine.memRead(address + BigInt(offset), 1)[0];
++      if (byte === 0) return text;
++      text += String.fromCharCode(byte);
++    }
++    throw new Error(`guest string exceeds ${maximum} bytes`);
++  }
++
++  private checkedSize(value: bigint): number {
++    if (value > MAX_GUEST_TRANSFER) {
++      throw new Error(`guest transfer size ${value} exceeds limit`);
++    }
++    return Number(value);
++  }
++
++  // ---- allocator ----------------------------------------------------------
++
++  allocate(size: bigint): bigint {
++    if (size > MAX_GUEST_TRANSFER) {
++      throw new Error(`allocation size ${size} exceeds limit`);
++    }
++
++    const reserved = align(maxBig(size, 1n), 16n);
++
++    for (let index = 0; index < this.freeBlocks.length; index++) {
++      const block = this.freeBlocks[index];
++      if (block.size < reserved) continue;
++
++      const address = block.address;
++      if (block.size === reserved) {
++        this.freeBlocks.splice(index, 1);
++      } else {
++        block.address += reserved;
++        block.size -= reserved;
++      }
++
++      this.allocations.set(address, { size, reserved });
++      return address;
++    }
++
++    if (this.heapCursor > HEAP_SIZE || reserved > HEAP_SIZE - this.heapCursor) {
++      throw new Error("guest heap exhausted");
++    }
++
++    const address = HEAP_BASE + this.heapCursor;
++    this.heapCursor += reserved;
++    this.allocations.set(address, { size, reserved });
++
++    return address;
++  }
++
++  release(address: bigint): void {
++    const allocation = this.allocations.get(address);
++    if (!allocation) {
++      throw new Error(`free unknown pointer 0x${address.toString(16)}`);
++    }
++
++    this.engine.memZero(address, Number(allocation.reserved));
++    this.allocations.delete(address);
++    this.freeBlocks.push({ address, size: allocation.reserved });
++    this.coalesceFreeBlocks();
++  }
++
++  /** Merges adjacent free blocks and gives the tail back to the heap cursor. */
++  private coalesceFreeBlocks(): void {
++    this.freeBlocks.sort((left, right) => (left.address < right.address ? -1 : 1));
++
++    const merged: FreeBlock[] = [];
++    for (const block of this.freeBlocks) {
++      const last = merged[merged.length - 1];
++      if (last && last.address + last.size === block.address) {
++        last.size += block.size;
++        continue;
++      }
++      merged.push({ ...block });
++    }
++
++    this.freeBlocks = merged;
++    while (this.freeBlocks.length !== 0) {
++      const block = this.freeBlocks[this.freeBlocks.length - 1];
++      if (block.address + block.size !== HEAP_BASE + this.heapCursor) break;
++      this.heapCursor -= block.size;
++      this.freeBlocks.pop();
++    }
++  }
++
++  // ---- memory services ----------------------------------------------------
++
++  private registerMemoryServices(): void {
++    this.addAliases(["_malloc"], () => this.setResult(this.allocate(this.argument(0))));
++
++    this.addAliases(["_malloc_good_size"], () =>
++      this.setResult(align(maxBig(this.argument(0), 1n), 16n)),
++    );
++
++    this.addAliases(["_malloc_size"], () => {
++      const allocation = this.allocations.get(this.argument(0));
++      this.setResult(allocation ? allocation.reserved : 0n);
++    });
++
++    this.addAliases(["_calloc"], () => {
++      const count = this.argument(0);
++      const size = this.argument(1);
++      if (count !== 0n && size > U64_MASK / count) {
++        throw new Error("allocation size overflows");
++      }
++
++      const total = count * size;
++      const address = this.allocate(total);
++      if (total !== 0n) this.engine.memZero(address, Number(total));
++      this.setResult(address);
++    });
++
++    this.addAliases(["_realloc", "_reallocf"], () => this.realloc());
++
++    this.addAliases(["_free"], () => {
++      const address = this.argument(0);
++      if (address !== 0n) this.release(address);
++      this.setResult(0n);
++    });
++
++    this.addAliases(["_memcpy", "_memmove"], () => {
++      const destination = this.argument(0);
++      const source = this.argument(1);
++      const length = this.checkedSize(this.argument(2));
++      if (length !== 0) {
++        this.engine.memWrite(destination, this.engine.memRead(source, length));
++      }
++      this.setResult(destination);
++    });
++
++    this.addAliases(["_memset"], () => {
++      const destination = this.argument(0);
++      const value = Number(this.argument(1) & 0xffn);
++      const length = this.checkedSize(this.argument(2));
++      if (length !== 0) {
++        this.engine.memWrite(destination, new Uint8Array(length).fill(value));
++      }
++      this.setResult(destination);
++    });
++
++    this.addAliases(["___bzero"], () => {
++      const destination = this.argument(0);
++      this.engine.memZero(destination, this.checkedSize(this.argument(1)));
++      this.setResult(destination);
++    });
++
++    // The _chk variants carry the destination's known size as a fourth
++    // argument; the guest relies on them trapping an overflow rather than
++    // truncating, so refuse instead of clamping.
++    this.addAliases(["___memcpy_chk"], () => {
++      const destination = this.argument(0);
++      const source = this.argument(1);
++      const length = this.argument(2);
++      if (length > this.argument(3)) {
++        throw new Error("__memcpy_chk destination is too small");
++      }
++      const size = this.checkedSize(length);
++      if (size !== 0) {
++        this.engine.memWrite(destination, this.engine.memRead(source, size));
++      }
++      this.setResult(destination);
++    });
++
++    this.addAliases(["___memset_chk"], () => {
++      const destination = this.argument(0);
++      const value = Number(this.argument(1) & 0xffn);
++      const length = this.argument(2);
++      if (length > this.argument(3)) {
++        throw new Error("__memset_chk destination is too small");
++      }
++      const size = this.checkedSize(length);
++      if (size !== 0) {
++        this.engine.memWrite(destination, new Uint8Array(size).fill(value));
++      }
++      this.setResult(destination);
++    });
++
++    this.addAliases(["_memcmp"], () => {
++      const left = this.argument(0);
++      const right = this.argument(1);
++      const length = this.checkedSize(this.argument(2));
++      this.setResult(BigInt(compareBytes(
++        this.engine.memRead(left, length),
++        this.engine.memRead(right, length),
++      )) & U64_MASK);
++    });
++
++    this.addAliases(["_strcmp"], () => {
++      const left = this.readCString(this.argument(0));
++      const right = this.readCString(this.argument(1));
++      this.setResult(BigInt(left < right ? -1 : left > right ? 1 : 0) & U64_MASK);
++    });
++
++    this.addAliases(["_strncmp"], () => {
++      const limit = Number(this.argument(2));
++      const left = this.readCString(this.argument(0)).slice(0, limit);
++      const right = this.readCString(this.argument(1)).slice(0, limit);
++      this.setResult(BigInt(left < right ? -1 : left > right ? 1 : 0) & U64_MASK);
++    });
++
++    this.addAliases(["_strlen"], () =>
++      this.setResult(BigInt(this.readCString(this.argument(0)).length)),
++    );
++  }
++
++  private realloc(): void {
++    const oldAddress = this.argument(0);
++    const newSize = this.argument(1);
++
++    if (oldAddress === 0n) {
++      this.setResult(this.allocate(newSize));
++      return;
++    }
++
++    const allocation = this.allocations.get(oldAddress);
++    if (!allocation) {
++      throw new Error(`reallocate unknown pointer 0x${oldAddress.toString(16)}`);
++    }
++
++    if (newSize <= allocation.reserved) {
++      allocation.size = newSize;
++      this.setResult(oldAddress);
++      return;
++    }
++
++    const newAddress = this.allocate(newSize);
++    const size = Number(allocation.size);
++    if (size !== 0) {
++      this.engine.memWrite(newAddress, this.engine.memRead(oldAddress, size));
++    }
++    this.release(oldAddress);
++    this.setResult(newAddress);
++  }
++}
++
++function compareBytes(left: Uint8Array, right: Uint8Array): number {
++  for (let index = 0; index < left.length; index++) {
++    if (left[index] !== right[index]) return left[index] < right[index] ? -1 : 1;
++  }
++  return 0;
++}
+diff --git a/frontend/src/apple/sap/signer.ts b/frontend/src/apple/sap/signer.ts
+new file mode 100644
+index 0000000..774e8c2
+--- /dev/null
++++ b/frontend/src/apple/sap/signer.ts
+@@ -0,0 +1,208 @@
++// The SAP setup protocol.
++//
++// Ported from ipatool's internal/sap/signer_local.go and protocol.go. Setting
++// up a signer takes two round trips to Apple and no credentials at all: the
++// only identity involved is the device's hardware id, which is the same guid
++// the rest of the client already sends in the clear.
++//
++// Once setup completes, signing is entirely local.
++
++import { buildPlist } from "../plist";
++import { Machine, type AssetBundle } from "./machine";
++
++const SETUP_CERTIFICATE_KEY = "sign-sap-setup-cert";
++const SETUP_BUFFER_KEY = "sign-sap-setup-buffer";
++const MAX_SETUP_BODY = 1 << 20;
++const SUPPORTED_VERSION = 200;
++
++const USER_AGENT =
++  "Configurator/2.17 (Macintosh; OS X 15.2; 24C5089c) AppleWebKit/0620.1.16.11.6";
++
++export interface SapConfig {
++  /** Bag key sign-sap-setup. */
++  setupURL: string;
++  /** Bag key sign-sap-setup-cert. */
++  certificateURL: string;
++  /** Bag key sign-sap-version; only 200 is implemented. */
++  version: number;
++  hardwareID: Uint8Array;
++}
++
++/**
++ * How the setup exchange reaches Apple. The browser has to tunnel it, and
++ * Node can use fetch directly, so the caller supplies it.
++ */
++export type Transport = (request: {
++  method: "GET" | "POST";
++  url: string;
++  headers: Record<string, string>;
++  body?: Uint8Array;
++}) => Promise<Uint8Array>;
++
++function validate(config: SapConfig): void {
++  if (config.version !== SUPPORTED_VERSION) {
++    throw new Error(`unsupported SAP version ${config.version}`);
++  }
++  if (config.hardwareID.length === 0 || config.hardwareID.length > 20) {
++    throw new Error("SAP hardware ID must contain between 1 and 20 bytes");
++  }
++  // The endpoints come from the bag, so they are checked rather than trusted.
++  // Our own origin is allowed whatever scheme it is served over, since these
++  // requests are proxied through it and a plain-http origin is a development
++  // setup, not a downgrade of an Apple endpoint.
++  const origin =
++    typeof self !== "undefined" && self.location ? self.location.origin : null;
++
++  for (const [label, value] of [
++    ["setup", config.setupURL],
++    ["certificate", config.certificateURL],
++  ] as const) {
++    let url: URL;
++    try {
++      url = new URL(value);
++    } catch {
++      throw new Error(`SAP ${label} URL must be absolute`);
++    }
++    if (!url.host || url.username) {
++      throw new Error(`SAP ${label} URL must be absolute`);
++    }
++    if (url.protocol !== "https:" && url.origin !== origin) {
++      throw new Error(`SAP ${label} URL must use HTTPS`);
++    }
++  }
++}
++
++/**
++ * Pulls one data value out of an Apple plist.
++ *
++ * plist.ts parses with DOMParser, which a worker does not have, and the setup
++ * plists are a single key holding a single base64 blob — so this reads that
++ * shape directly rather than pulling in an XML parser.
++ */
++function plistBytes(document: Uint8Array, key: string): Uint8Array {
++  if (document.length > MAX_SETUP_BODY) {
++    throw new Error(`Apple response exceeds ${MAX_SETUP_BODY} bytes`);
++  }
++
++  const xml = new TextDecoder().decode(document);
++  const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++  const match = new RegExp(
++    `<key>\\s*${escaped}\\s*</key>\\s*<data>([\\s\\S]*?)</data>`,
++  ).exec(xml);
++
++  if (!match) throw new Error(`Apple plist is missing ${key}`);
++
++  const binary = atob(match[1].replace(/\s+/g, ""));
++  if (binary.length === 0) throw new Error(`Apple plist is missing ${key}`);
++
++  const bytes = new Uint8Array(binary.length);
++  for (let index = 0; index < binary.length; index++) {
++    bytes[index] = binary.charCodeAt(index);
++  }
++
++  return bytes;
++}
++
++export class Signer {
++  private readonly machine: Machine;
++  private readonly context: bigint;
++  private readonly hardwareID: Uint8Array;
++  private closed = false;
++
++  private constructor(machine: Machine, context: bigint, hardwareID: Uint8Array) {
++    this.machine = machine;
++    this.context = context;
++    this.hardwareID = hardwareID;
++  }
++
++  static async create(
++    bundle: AssetBundle,
++    config: SapConfig,
++    transport: Transport,
++  ): Promise<Signer> {
++    validate(config);
++
++    const machine = await Machine.open(bundle);
++    let complete = false;
++
++    try {
++      const context = machine.initialize(config.hardwareID);
++
++      const certificate = plistBytes(
++        await transport({
++          method: "GET",
++          url: config.certificateURL,
++          headers: { "User-Agent": USER_AGENT },
++        }),
++        SETUP_CERTIFICATE_KEY,
++      );
++
++      const first = machine.exchange(
++        config.version,
++        config.hardwareID,
++        context,
++        certificate,
++      );
++      if (first.state !== 1) {
++        throw new Error(`SAP setup entered unexpected state ${first.state}`);
++      }
++      if (first.output.length === 0) {
++        throw new Error("SAP setup message is empty");
++      }
++
++      const reply = plistBytes(
++        await transport({
++          method: "POST",
++          url: config.setupURL,
++          headers: {
++            "Content-Type": "application/x-plist",
++            "User-Agent": USER_AGENT,
++          },
++          body: new TextEncoder().encode(
++            buildPlist({ [SETUP_BUFFER_KEY]: first.output }),
++          ),
++        }),
++        SETUP_BUFFER_KEY,
++      );
++
++      const second = machine.exchange(
++        config.version,
++        config.hardwareID,
++        context,
++        reply,
++      );
++      if (second.state !== 0) {
++        throw new Error(`SAP setup completed in unexpected state ${second.state}`);
++      }
++
++      complete = true;
++      return new Signer(machine, context, config.hardwareID);
++    } finally {
++      if (!complete) machine.close();
++    }
++  }
++
++  /** Signs a request payload. Local, with no network involved. */
++  sign(payload: Uint8Array): Uint8Array {
++    if (this.closed) throw new Error("SAP signer is closed");
++
++    const signature = this.machine.sign(this.context, payload);
++    if (signature.length === 0) {
++      throw new Error("sign Apple request: signature is empty");
++    }
++
++    return signature;
++  }
++
++  close(): void {
++    if (this.closed) return;
++    this.closed = true;
++
++    try {
++      this.machine.teardown(this.context);
++    } finally {
++      this.machine.close();
++      this.hardwareID.fill(0);
++    }
++  }
++}
+diff --git a/frontend/src/apple/sap/unicorn-js.d.ts b/frontend/src/apple/sap/unicorn-js.d.ts
+new file mode 100644
+index 0000000..6440103
+--- /dev/null
++++ b/frontend/src/apple/sap/unicorn-js.d.ts
+@@ -0,0 +1,8 @@
++// unicorn.js ships no type declarations. The surface used here is narrow and
++// fully exercised by engine.ts, so it is declared as a loose module rather
++// than modelled in detail.
++declare module "@alexaltea/unicorn-js/x86" {
++  // eslint-disable-next-line @typescript-eslint/no-explicit-any
++  const factory: () => Promise<any>;
++  export default factory;
++}
+diff --git a/frontend/src/apple/sap/worker.ts b/frontend/src/apple/sap/worker.ts
+new file mode 100644
+index 0000000..758ebec
+--- /dev/null
++++ b/frontend/src/apple/sap/worker.ts
+@@ -0,0 +1,104 @@
++/// <reference lib="webworker" />
++// The SAP signer, off the main thread.
++//
++// Setting one up runs about ten million emulated instructions, and signing
++// runs a few million more: roughly 115 seconds and 12 seconds respectively in
++// Chrome on a laptop. Both would freeze the tab, so both happen here, and the
++// worker is set up once and kept for the session.
++
++import { loadAssets, type AssetProgress } from "./assets";
++import { Signer, type Transport } from "./signer";
++
++export type WorkerRequest =
++  | { type: "setup"; hardwareID: Uint8Array; accessToken: string | null }
++  | { type: "sign"; id: number; payload: Uint8Array };
++
++export type WorkerResponse =
++  | { type: "progress"; phase: "assets"; asset: AssetProgress }
++  | { type: "progress"; phase: "setup" }
++  | { type: "ready" }
++  | { type: "signed"; id: number; signature: Uint8Array }
++  | { type: "error"; id?: number; message: string };
++
++const scope = self as unknown as DedicatedWorkerGlobalScope;
++
++// A worker has no sessionStorage, so the access token comes in with the
++// setup request rather than being read here.
++let accessHeaders: Record<string, string> = {};
++
++// The setup endpoints are proxied by the backend; nothing here is secret.
++const transport: Transport = async ({ method, url, body }) => {
++  const response = await fetch(url, {
++    method,
++    headers: {
++      ...accessHeaders,
++      ...(method === "POST" ? { "Content-Type": "application/x-plist" } : {}),
++    },
++    body: body ? new Blob([body as BlobPart]) : undefined,
++  });
++
++  if (!response.ok) {
++    const detail = await response.json().catch(() => ({}));
++    throw new Error(detail.error ?? `SAP setup request failed (${response.status})`);
++  }
++
++  return new Uint8Array(await response.arrayBuffer());
++};
++
++let signer: Signer | null = null;
++
++function post(message: WorkerResponse, transfer?: Transferable[]) {
++  scope.postMessage(message, transfer ?? []);
++}
++
++async function setup(hardwareID: Uint8Array) {
++  const bundle = await loadAssets(accessHeaders, (asset) => {
++    post({ type: "progress", phase: "assets", asset });
++  });
++
++  post({ type: "progress", phase: "setup" });
++
++  signer = await Signer.create(
++    bundle,
++    {
++      // Routed through the backend rather than to Apple directly, so the
++      // worker needs no tunnel of its own.
++      setupURL: new URL("/api/sap/setup", scope.location.origin).toString(),
++      certificateURL: new URL("/api/sap/certificate", scope.location.origin).toString(),
++      version: 200,
++      hardwareID,
++    },
++    transport,
++  );
++
++  post({ type: "ready" });
++}
++
++scope.onmessage = async (event: MessageEvent<WorkerRequest>) => {
++  const request = event.data;
++
++  try {
++    if (request.type === "setup") {
++      if (signer) {
++        post({ type: "ready" });
++        return;
++      }
++      accessHeaders = request.accessToken
++        ? { "X-Access-Token": request.accessToken }
++        : {};
++      await setup(request.hardwareID);
++      return;
++    }
++
++    if (!signer) throw new Error("SAP signer is not ready");
++
++    const signature = signer.sign(request.payload);
++    post({ type: "signed", id: request.id, signature }, [signature.buffer]);
++  } catch (error) {
++    post({
++      type: "error",
++      id: request.type === "sign" ? request.id : undefined,
++      message: error instanceof Error ? error.message : String(error),
++    });
++  }
++};
+diff --git a/frontend/vite.config.ts b/frontend/vite.config.ts
+index 687769b..12d7fdc 100644
+--- a/frontend/vite.config.ts
++++ b/frontend/vite.config.ts
+@@ -4,6 +4,9 @@ import tailwindcss from "@tailwindcss/vite";
+ 
+ export default defineConfig({
+   plugins: [react(), tailwindcss()],
++  // The SAP signer worker loads unicorn.js dynamically, and a code-splitting
++  // build cannot emit that as IIFE.
++  worker: { format: "es" },
+   server: {
+     proxy: {
+       "/api": "http://localhost:8080",
+-- 
+2.39.5
+

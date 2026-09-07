@@ -1,0 +1,87 @@
+From 5d058308ce05adca72b515a0aef23b5f2e934949 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 18:13:10 +0000
+Subject: [PATCH] Print the whole exchange when volumeStore refuses
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+serialNumber was wrong: deployed and retried, the error did not change by a
+character. That is the fourth hypothesis this has killed, and every one of them
+was reasoning from the shape of the response rather than from the exchange.
+
+So the exchange goes in the error: which endpoint answered, with what status,
+which keys were actually sent, and the response itself, truncated. A failure
+response carries no songList, so there is no download URL in it.
+
+One fact is still unexplained and this is what settles it: the response keys
+include cancel-purchase-batch and m-allowed, which is the shape of a purchase
+answer, not of a volumeStore download one — yet the throw comes from
+getDownloadInfo, and the download button only ever calls startDownload.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ frontend/src/apple/download.ts        | 14 +++++++++++++-
+ frontend/tests/apple/download.test.ts | 22 ++++++++++++++++++++++
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/frontend/src/apple/download.ts b/frontend/src/apple/download.ts
+index 96423af..fe3ecfb 100644
+--- a/frontend/src/apple/download.ts
++++ b/frontend/src/apple/download.ts
+@@ -158,9 +158,21 @@ export async function getDownloadInfo(
+             ? "empty"
+             : String(dict.failureType);
+       const keys = Object.keys(dict).filter((key) => key !== "dialog");
++      // Guessing has produced four wrong answers, so this carries the whole
++      // exchange instead: what was asked, where, and what came back. The
++      // response keys say cancel-purchase-batch and m-allowed, which is the
++      // shape of a purchase answer, not of a download one — and the only way
++      // to settle which endpoint actually refused is to print both sides.
++      // A failure response has no songList, so there is no download URL in it
++      // to leak; it is truncated regardless.
++      const dump = String(response.body ?? "").replace(/\s+/g, " ").slice(0, 600);
+       throw new DownloadError(
+         `${customerMessage ?? i18n.t("errors.download.noItems")} ` +
+-          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"})`,
++          `(code=${code} store=${account.store} keys=${keys.join(",") || "none"} ` +
++          `http=${response.status} ` +
++          `endpoint=${requestHost}${requestPath.split("?")[0]} ` +
++          `sent=${Object.keys(payload).join(",")} ` +
++          `resp=${dump})`,
+         typeof dict.failureType === "string" && dict.failureType
+           ? dict.failureType
+           : undefined,
+diff --git a/frontend/tests/apple/download.test.ts b/frontend/tests/apple/download.test.ts
+index 47730b4..3b997b6 100644
+--- a/frontend/tests/apple/download.test.ts
++++ b/frontend/tests/apple/download.test.ts
+@@ -108,3 +108,25 @@ describe("the volumeStore payload", () => {
+     expect(sent.body).toContain("<string>0</string>");
+   });
+ });
++
++// Four hypotheses have been wrong. This asserts the report carries the whole
++// exchange, which is what settles the next one without another guess.
++describe("the failure report", () => {
++  beforeEach(() => appleRequest.mockReset());
++
++  it("carries the endpoint, the status, what was sent and what came back", async () => {
++    respond({ failureType: "", customerMessage: "App Not Available" });
++
++    const error = await getDownloadInfo(account, app).catch((e) => e);
++
++    expect(error.message).toContain("endpoint=");
++    expect(error.message).toContain("volumeStoreDownloadProduct");
++    expect(error.message).toContain("http=200");
++    // Proof of what actually went out — the one thing that has been assumed
++    // rather than shown this whole time.
++    expect(error.message).toContain("sent=");
++    expect(error.message).toContain("serialNumber");
++    expect(error.message).toContain("resp=");
++    expect(error.message).toContain("App Not Available");
++  });
++});
+-- 
+2.39.5
+

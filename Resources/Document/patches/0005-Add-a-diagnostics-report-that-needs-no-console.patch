@@ -1,0 +1,926 @@
+From b3ead27621f2517e37e737a7288bcc89e09ba461 Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 09:06:35 +0000
+Subject: [PATCH 5/5] Add a diagnostics report that needs no console
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Sign-in failures are diagnosed from fields that are not in the browser console
+at all — whether the SAP assets verified, what the server answered, how far the
+signer got. Asking for them meant asking someone to open devtools, guess which
+lines mattered, and then be careful not to paste a credential that happened to
+be nearby.
+
+Settings now has a button that collects all of it into one block of text, to
+copy or to save as a .txt.
+
+The report is built by a function that takes accounts and emits only a count
+and a masked address each, so there is no path from a password, passwordToken,
+cookie or DSID into the output. That property is what the tests assert, with
+distinctive values for every credential field.
+
+Each section is fetched on its own, and a section that cannot be read says so
+inline — an API that does not answer is itself the finding, and should not take
+the rest of the report with it.
+---
+ .../components/Settings/DiagnosticsModal.tsx  | 175 ++++++++++++++++
+ .../src/components/Settings/SettingsPage.tsx  |  22 ++
+ frontend/src/locales/en-US.json               |  12 ++
+ frontend/src/locales/ja.json                  |  12 ++
+ frontend/src/locales/ko.json                  |  12 ++
+ frontend/src/locales/ru.json                  |  12 ++
+ frontend/src/locales/zh-CN.json               |  12 ++
+ frontend/src/locales/zh-TW.json               |  12 ++
+ frontend/src/utils/diagnostics.ts             | 174 ++++++++++++++++
+ .../components/DiagnosticsModal.test.tsx      | 123 +++++++++++
+ frontend/tests/utils/diagnostics.test.ts      | 197 ++++++++++++++++++
+ 11 files changed, 763 insertions(+)
+ create mode 100644 frontend/src/components/Settings/DiagnosticsModal.tsx
+ create mode 100644 frontend/src/utils/diagnostics.ts
+ create mode 100644 frontend/tests/components/DiagnosticsModal.test.tsx
+ create mode 100644 frontend/tests/utils/diagnostics.test.ts
+
+diff --git a/frontend/src/components/Settings/DiagnosticsModal.tsx b/frontend/src/components/Settings/DiagnosticsModal.tsx
+new file mode 100644
+index 0000000..5da7276
+--- /dev/null
++++ b/frontend/src/components/Settings/DiagnosticsModal.tsx
+@@ -0,0 +1,175 @@
++import { useEffect, useState } from "react";
++import { useTranslation } from "react-i18next";
++import Modal from "../common/Modal";
++import Spinner from "../common/Spinner";
++import { apiGet } from "../../api/client";
++import { useAccountsStore } from "../../store/accounts";
++import { useSapStore } from "../../store/sap";
++import {
++  buildDiagnostics,
++  maskHardwareID,
++  type SapAssetsStatus,
++  type ServerSettings,
++} from "../../utils/diagnostics";
++import { useToastStore } from "../../store/toast";
++
++/**
++ * Everything needed to explain a failed sign-in, in one block that can be
++ * pasted into an issue or saved to a file.
++ *
++ * Gathering it is a button rather than a set of instructions because the
++ * alternative is asking someone to open a console, find the right error, and
++ * judge which surrounding lines matter — and the fields that actually decide
++ * the diagnosis (whether the assets verified, what the server answered) are not
++ * in the console at all.
++ */
++export default function DiagnosticsModal({
++  open,
++  onClose,
++}: {
++  open: boolean;
++  onClose: () => void;
++}) {
++  const { t, i18n } = useTranslation();
++  const accounts = useAccountsStore((state) => state.accounts);
++  const { stage, percent, error, hardwareID } = useSapStore();
++  const addToast = useToastStore((state) => state.addToast);
++
++  const [report, setReport] = useState<string | null>(null);
++  const [collecting, setCollecting] = useState(false);
++
++  useEffect(() => {
++    if (!open) return;
++    let cancelled = false;
++
++    (async () => {
++      setCollecting(true);
++      setReport(null);
++
++      // Each section is fetched on its own so one unreachable endpoint does
++      // not take the rest of the report with it — and "unreachable" is often
++      // the finding.
++      const [server, serverError] = await apiGet<ServerSettings>(
++        "/api/settings",
++      )
++        .then((value) => [value, null] as const)
++        .catch((e) => [null, e instanceof Error ? e.message : String(e)] as const);
++
++      const [sapAssets, sapAssetsError] = await apiGet<SapAssetsStatus>(
++        "/api/sap/assets",
++      )
++        .then((value) => [value, null] as const)
++        .catch((e) => [null, e instanceof Error ? e.message : String(e)] as const);
++
++      if (cancelled) return;
++
++      setReport(
++        buildDiagnostics({
++          server,
++          serverError,
++          sapAssets,
++          sapAssetsError,
++          signer: {
++            stage,
++            percent,
++            error,
++            hardwareID: maskHardwareID(hardwareID),
++          },
++          accounts,
++          language: i18n.language,
++        }),
++      );
++      setCollecting(false);
++    })();
++
++    return () => {
++      cancelled = true;
++    };
++    // Re-collected each time the modal opens, not on every store change.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [open]);
++
++  async function copy() {
++    if (!report) return;
++    try {
++      if (navigator.clipboard?.writeText) {
++        await navigator.clipboard.writeText(report);
++      } else {
++        // Older Safari on iOS has no clipboard API outside a user gesture on
++        // the element itself; the textarea route still works there.
++        const area = document.createElement("textarea");
++        area.value = report;
++        area.style.position = "fixed";
++        area.style.left = "-999999px";
++        document.body.appendChild(area);
++        area.focus();
++        area.select();
++        document.execCommand("copy");
++        area.remove();
++      }
++      addToast(t("settings.diagnostics.copied"), "success");
++    } catch {
++      addToast(t("settings.diagnostics.copyFailed"), "error");
++    }
++  }
++
++  function download() {
++    if (!report) return;
++    const blob = new Blob([report], { type: "text/plain;charset=utf-8" });
++    const url = URL.createObjectURL(blob);
++    const anchor = document.createElement("a");
++    anchor.href = url;
++    anchor.download = `assppweb-diagnostics-${new Date()
++      .toISOString()
++      .replace(/[:.]/g, "-")}.txt`;
++    document.body.appendChild(anchor);
++    anchor.click();
++    anchor.remove();
++    // Not revoked immediately: some browsers drop the download if the URL
++    // disappears before the click has been handled.
++    setTimeout(() => URL.revokeObjectURL(url), 10_000);
++  }
++
++  return (
++    <Modal open={open} onClose={onClose} title={t("settings.diagnostics.title")}>
++      <div className="min-w-0 space-y-4">
++        <p className="text-sm text-gray-600 dark:text-gray-300">
++          {t("settings.diagnostics.description")}
++        </p>
++
++        {collecting || !report ? (
++          <div className="flex items-center gap-2 py-6 text-sm text-gray-500 dark:text-gray-400">
++            <Spinner />
++            {t("settings.diagnostics.collecting")}
++          </div>
++        ) : (
++          <>
++            {/* Selectable rather than read-only: on a phone, long-press to copy
++                works even when the clipboard API does not. */}
++            <pre
++              className="max-h-72 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-lg bg-gray-50 p-3 text-xs leading-relaxed text-gray-800 select-text [overflow-wrap:anywhere] dark:bg-gray-950 dark:text-gray-200"
++              aria-label={t("settings.diagnostics.reportLabel")}
++            >
++              {report}
++            </pre>
++
++            <div className="flex flex-wrap gap-2">
++              <button
++                onClick={copy}
++                className="rounded-full bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-blue-700"
++              >
++                {t("settings.diagnostics.copy")}
++              </button>
++              <button
++                onClick={download}
++                className="rounded-full border border-gray-300 px-4 py-2 text-sm font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800"
++              >
++                {t("settings.diagnostics.download")}
++              </button>
++            </div>
++          </>
++        )}
++      </div>
++    </Modal>
++  );
++}
+diff --git a/frontend/src/components/Settings/SettingsPage.tsx b/frontend/src/components/Settings/SettingsPage.tsx
+index bd8d5bb..df85018 100644
+--- a/frontend/src/components/Settings/SettingsPage.tsx
++++ b/frontend/src/components/Settings/SettingsPage.tsx
+@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, type ReactNode } from "react";
+ import { useTranslation } from "react-i18next";
+ import PageContainer from "../Layout/PageContainer";
+ import Modal from "../common/Modal";
++import DiagnosticsModal from "./DiagnosticsModal";
+ import { useAccountsStore } from "../../store/accounts";
+ import { useToastStore } from "../../store/toast";
+ import { apiGet } from "../../api/client";
+@@ -36,6 +37,7 @@ export default function SettingsPage() {
+   const [country, setCountry] = useState(
+     () => localStorage.getItem("asspp-default-country") || "US",
+   );
++  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+   const [entity, setEntity] = useState(
+     () => localStorage.getItem("asspp-default-entity") || "software",
+   );
+@@ -413,8 +415,28 @@ export default function SettingsPage() {
+             </dl>
+           )}
+         </section>
++
++        <section className="min-w-0 rounded-lg border border-gray-200 bg-white p-4 sm:p-6 dark:border-gray-800 dark:bg-gray-900">
++          <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
++            {t("settings.diagnostics.title")}
++          </h2>
++          <p className="mb-4 max-w-full text-[clamp(0.5625rem,2.8vw,0.875rem)] leading-relaxed tracking-[-0.015em] text-gray-600 dark:text-gray-400">
++            {t("settings.diagnostics.sectionDescription")}
++          </p>
++          <button
++            onClick={() => setDiagnosticsOpen(true)}
++            className="min-h-11 w-full min-w-0 whitespace-normal break-words rounded-lg border border-blue-300 px-4 py-2 text-center text-sm font-medium text-blue-600 transition-colors hover:bg-blue-50 sm:w-auto sm:px-4 dark:border-blue-800 dark:text-blue-400 dark:hover:bg-blue-900/30"
++          >
++            {t("settings.diagnostics.open")}
++          </button>
++        </section>
+       </div>
+ 
++      <DiagnosticsModal
++        open={diagnosticsOpen}
++        onClose={() => setDiagnosticsOpen(false)}
++      />
++
+       <Modal
+         open={exportModalOpen}
+         onClose={() => setExportModalOpen(false)}
+diff --git a/frontend/src/locales/en-US.json b/frontend/src/locales/en-US.json
+index 3f99f6c..f977ab7 100644
+--- a/frontend/src/locales/en-US.json
++++ b/frontend/src/locales/en-US.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web — Apple app and license manager.",
+       "buildCommit": "Build Commit",
+       "buildDate": "Build Date"
++    },
++    "diagnostics": {
++      "title": "Diagnostics",
++      "sectionDescription": "When sign-in fails, this collects the server state, SAP asset state, signer state and browser environment into one block of text you can copy or save to a file. It contains no password, passwordToken, cookie or DSID by construction; accounts appear as a first letter plus domain.",
++      "open": "Generate diagnostics",
++      "collecting": "Collecting…",
++      "copy": "Copy",
++      "download": "Download .txt",
++      "copied": "Diagnostics copied to the clipboard",
++      "copyFailed": "Copy failed — press and hold the text to select it manually",
++      "description": "Paste the text below to whoever is helping you. It contains no credentials.",
++      "reportLabel": "Diagnostics report text"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/locales/ja.json b/frontend/src/locales/ja.json
+index 41656af..33f2300 100644
+--- a/frontend/src/locales/ja.json
++++ b/frontend/src/locales/ja.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web — Appleアプリとライセンスの管理。",
+       "buildCommit": "ビルドコミット",
+       "buildDate": "ビルド日時"
++    },
++    "diagnostics": {
++      "title": "診断情報",
++      "sectionDescription": "サインインに失敗したとき、サーバーの状態・SAP アセットの状態・署名器の状態・ブラウザ環境をまとめて収集し、テキストとしてコピーするかファイルに保存できます。パスワード・passwordToken・cookie・DSID は構造上含まれません。アカウントは先頭文字とドメインのみ表示されます。",
++      "open": "診断情報を生成",
++      "collecting": "収集中…",
++      "copy": "コピー",
++      "download": ".txt をダウンロード",
++      "copied": "診断情報をクリップボードにコピーしました",
++      "copyFailed": "コピーできませんでした。テキストを長押しして手動で選択してください",
++      "description": "下記のテキストを支援者に貼り付けてください。認証情報は含まれていません。",
++      "reportLabel": "診断情報のテキスト"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/locales/ko.json b/frontend/src/locales/ko.json
+index f21fe68..192bbc1 100644
+--- a/frontend/src/locales/ko.json
++++ b/frontend/src/locales/ko.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web — Apple 앱·라이선스 관리.",
+       "buildCommit": "빌드 커밋",
+       "buildDate": "빌드 날짜"
++    },
++    "diagnostics": {
++      "title": "진단 정보",
++      "sectionDescription": "로그인이 실패할 때 서버 상태, SAP 자산 상태, 서명기 상태, 브라우저 환경을 한 번에 수집해 텍스트로 복사하거나 파일로 저장할 수 있습니다. 비밀번호, passwordToken, 쿠키, DSID는 구조적으로 포함되지 않으며 계정은 첫 글자와 도메인만 표시됩니다.",
++      "open": "진단 정보 생성",
++      "collecting": "수집 중…",
++      "copy": "복사",
++      "download": ".txt 다운로드",
++      "copied": "진단 정보가 클립보드에 복사되었습니다",
++      "copyFailed": "복사 실패 — 텍스트를 길게 눌러 직접 선택하세요",
++      "description": "아래 텍스트를 도와주는 사람에게 붙여넣으세요. 자격 증명은 포함되지 않습니다.",
++      "reportLabel": "진단 정보 텍스트"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/locales/ru.json b/frontend/src/locales/ru.json
+index 1212e54..266a18e 100644
+--- a/frontend/src/locales/ru.json
++++ b/frontend/src/locales/ru.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web — приложения и лицензии Apple.",
+       "buildCommit": "Коммит сборки",
+       "buildDate": "Дата сборки"
++    },
++    "diagnostics": {
++      "title": "Диагностика",
++      "sectionDescription": "При сбое входа этот раздел собирает состояние сервера, состояние активов SAP, состояние подписанта и окружение браузера в один блок текста, который можно скопировать или сохранить в файл. По построению он не содержит пароль, passwordToken, cookie или DSID; учётные записи показываются как первая буква и домен.",
++      "open": "Собрать диагностику",
++      "collecting": "Сбор…",
++      "copy": "Копировать",
++      "download": "Скачать .txt",
++      "copied": "Диагностика скопирована в буфер обмена",
++      "copyFailed": "Не удалось скопировать — удерживайте текст, чтобы выделить его вручную",
++      "description": "Вставьте текст ниже тому, кто вам помогает. Учётных данных в нём нет.",
++      "reportLabel": "Текст диагностики"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/locales/zh-CN.json b/frontend/src/locales/zh-CN.json
+index d6c3082..5bc8497 100644
+--- a/frontend/src/locales/zh-CN.json
++++ b/frontend/src/locales/zh-CN.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web —— Apple 应用与许可证管理。",
+       "buildCommit": "构建提交",
+       "buildDate": "构建日期"
++    },
++    "diagnostics": {
++      "title": "诊断信息",
++      "sectionDescription": "登录失败时，这里可以一次性收集服务端状态、SAP 资产状态、签名器状态和浏览器环境，复制成一段文本或下载为文件。内容按构造不包含密码、passwordToken、cookie 和 DSID，账号只显示首字母加域名。",
++      "open": "生成诊断信息",
++      "collecting": "正在收集…",
++      "copy": "复制",
++      "download": "下载 .txt",
++      "copied": "诊断信息已复制到剪贴板",
++      "copyFailed": "复制失败，请长按文本框手动选择复制",
++      "description": "把下面这段文本贴给帮你排查的人。它不含任何凭据。",
++      "reportLabel": "诊断信息文本"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/locales/zh-TW.json b/frontend/src/locales/zh-TW.json
+index 7227fe6..3d275c8 100644
+--- a/frontend/src/locales/zh-TW.json
++++ b/frontend/src/locales/zh-TW.json
+@@ -290,6 +290,18 @@
+       "description": "Asspp Web —— Apple 應用程式與授權管理。",
+       "buildCommit": "構建提交",
+       "buildDate": "構建日期"
++    },
++    "diagnostics": {
++      "title": "診斷資訊",
++      "sectionDescription": "登入失敗時，這裡可以一次收集伺服器狀態、SAP 資產狀態、簽章器狀態與瀏覽器環境，複製成一段文字或下載為檔案。內容依設計不包含密碼、passwordToken、cookie 與 DSID，帳號只顯示首字母加網域。",
++      "open": "產生診斷資訊",
++      "collecting": "正在收集…",
++      "copy": "複製",
++      "download": "下載 .txt",
++      "copied": "診斷資訊已複製到剪貼簿",
++      "copyFailed": "複製失敗，請長按文字框手動選取複製",
++      "description": "把下面這段文字貼給幫你排查的人。它不含任何憑證。",
++      "reportLabel": "診斷資訊文字"
+     }
+   },
+   "countries": {
+diff --git a/frontend/src/utils/diagnostics.ts b/frontend/src/utils/diagnostics.ts
+new file mode 100644
+index 0000000..e17444d
+--- /dev/null
++++ b/frontend/src/utils/diagnostics.ts
+@@ -0,0 +1,174 @@
++import type { Account } from "../types";
++import type { SapStage } from "../store/sap";
++
++// Collects everything needed to diagnose a failed sign-in into one block of
++// text that can be pasted into an issue.
++//
++// The point of the shape of this module is what it cannot contain. It takes
++// accounts as input and emits only a count and a masked address per account,
++// so there is no code path from a stored password, passwordToken, cookie or
++// DSID into the report. A user should be able to paste this in public without
++// having to read it line by line first — and the note at the top says so, so
++// they are not taking that on faith either.
++
++export interface ServerSettings {
++  uptime?: number;
++  buildCommit?: string;
++  buildDate?: string;
++  port?: number;
++  dataDir?: string;
++  publicBaseUrl?: string;
++  disableHttpsRedirect?: boolean;
++  autoCleanupDays?: number;
++  autoCleanupMaxMB?: number;
++  maxDownloadMB?: number;
++  downloadThreads?: number;
++}
++
++export interface SapAssetsStatus {
++  available?: string[];
++  missing?: string[];
++  corrupt?: string[];
++  ready?: boolean;
++  fetching?: boolean;
++  progress?: { stage?: string; found?: string[] } | null;
++  error?: string | null;
++}
++
++export interface DiagnosticsInput {
++  server?: ServerSettings | null;
++  /** Why the server could not be read, if it could not be. */
++  serverError?: string | null;
++  sapAssets?: SapAssetsStatus | null;
++  sapAssetsError?: string | null;
++  signer: {
++    stage: SapStage;
++    percent: number | null;
++    error: string | null;
++    /** Masked before it gets here; see maskHardwareID. */
++    hardwareID: string | null;
++  };
++  accounts: Account[];
++  language: string;
++  now?: Date;
++}
++
++/** `richard@example.com` -> `r***@example.com`. Keeps enough to tell accounts apart. */
++export function maskEmail(email: string): string {
++  const at = email.indexOf("@");
++  if (at <= 0) return "***";
++  return `${email[0]}***${email.slice(at)}`;
++}
++
++/**
++ * Shortens the device identifier. The full guid is what a signer is bound to
++ * and is sent to Apple on every request, so only a prefix goes in a report.
++ */
++export function maskHardwareID(id: string | null): string | null {
++  if (!id) return null;
++  return id.length <= 4 ? "***" : `${id.slice(0, 4)}…`;
++}
++
++function line(label: string, value: unknown): string {
++  if (value === null || value === undefined || value === "") {
++    return `${label}: -`;
++  }
++  return `${label}: ${value}`;
++}
++
++/**
++ * Builds the report. Never throws: a section that could not be read says so
++ * inline, because "the server did not answer" is itself the useful finding.
++ */
++export function buildDiagnostics(input: DiagnosticsInput): string {
++  const now = input.now ?? new Date();
++  const out: string[] = [];
++
++  out.push("AssppWeb diagnostics");
++  out.push(`generated: ${now.toISOString()}`);
++  out.push(
++    "note: contains no password, passwordToken, cookie or DSID by construction.",
++  );
++  out.push("");
++
++  out.push("[browser]");
++  out.push(line("  userAgent", navigator.userAgent));
++  out.push(line("  language", input.language));
++  out.push(line("  page", location.origin));
++  out.push(line("  secureContext", String(location.protocol === "https:")));
++  out.push(
++    line(
++      "  worker",
++      typeof Worker === "undefined" ? "unavailable" : "available",
++    ),
++  );
++  out.push("");
++
++  out.push("[server]");
++  if (input.server) {
++    out.push(line("  buildCommit", input.server.buildCommit));
++    out.push(line("  buildDate", input.server.buildDate));
++    out.push(line("  uptimeSeconds", input.server.uptime));
++    out.push(line("  port", input.server.port));
++    out.push(line("  dataDir", input.server.dataDir));
++    out.push(line("  publicBaseUrl", input.server.publicBaseUrl));
++    out.push(
++      line("  httpsRedirectDisabled", String(!!input.server.disableHttpsRedirect)),
++    );
++    out.push(line("  downloadThreads", input.server.downloadThreads));
++    out.push(line("  maxDownloadMB", input.server.maxDownloadMB));
++  } else {
++    out.push(`  unreachable: ${input.serverError ?? "unknown"}`);
++  }
++  out.push("");
++
++  out.push("[sap assets]");
++  if (input.sapAssets) {
++    out.push(line("  ready", String(!!input.sapAssets.ready)));
++    out.push(line("  fetching", String(!!input.sapAssets.fetching)));
++    out.push(
++      line("  available", (input.sapAssets.available ?? []).join(", ")),
++    );
++    out.push(line("  missing", (input.sapAssets.missing ?? []).join(", ")));
++    out.push(line("  corrupt", (input.sapAssets.corrupt ?? []).join(", ")));
++    out.push(line("  stage", input.sapAssets.progress?.stage));
++    out.push(
++      line("  found", (input.sapAssets.progress?.found ?? []).join(", ")),
++    );
++    if (input.sapAssets.error) {
++      out.push("  error:");
++      for (const part of String(input.sapAssets.error).split("\n")) {
++        out.push(`    ${part}`);
++      }
++    }
++  } else {
++    out.push(`  unreadable: ${input.sapAssetsError ?? "unknown"}`);
++  }
++  out.push("");
++
++  out.push("[signer]");
++  out.push(line("  stage", input.signer.stage));
++  out.push(line("  percent", input.signer.percent));
++  out.push(line("  hardwareID", input.signer.hardwareID));
++  if (input.signer.error) {
++    out.push("  error:");
++    for (const part of String(input.signer.error).split("\n")) {
++      out.push(`    ${part}`);
++    }
++  }
++  out.push("");
++
++  out.push("[accounts]");
++  out.push(line("  count", input.accounts.length));
++  // Deliberately only these two fields per account. Everything else on an
++  // Account is a credential or derived from one.
++  for (const account of input.accounts) {
++    out.push(
++      `  - ${maskEmail(account.email)}  store=${account.store || "-"}  ` +
++        `hasPassword=${account.password ? "yes" : "no"}  ` +
++        `guid=${maskHardwareID(account.deviceIdentifier) ?? "-"}`,
++    );
++  }
++
++  return out.join("\n");
++}
+diff --git a/frontend/tests/components/DiagnosticsModal.test.tsx b/frontend/tests/components/DiagnosticsModal.test.tsx
+new file mode 100644
+index 0000000..e2f8d4e
+--- /dev/null
++++ b/frontend/tests/components/DiagnosticsModal.test.tsx
+@@ -0,0 +1,123 @@
++import { describe, it, expect, vi, beforeEach } from "vitest";
++import { render, screen, waitFor } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import DiagnosticsModal from "../../src/components/Settings/DiagnosticsModal";
++import { apiGet } from "../../src/api/client";
++import { useAccountsStore } from "../../src/store/accounts";
++import { useSapStore } from "../../src/store/sap";
++import type { Account } from "../../src/types";
++
++vi.mock("../../src/api/client", () => ({ apiGet: vi.fn() }));
++vi.mock("../../src/store/toast", () => ({
++  useToastStore: Object.assign(vi.fn(() => ({ addToast: vi.fn() })), {
++    // The component reads the store via a selector.
++    ...{},
++  }),
++}));
++
++const SECRET = "password-that-must-not-appear";
++
++const account: Account = {
++  email: "richard@example.com",
++  password: SECRET,
++  appleId: "1234567890",
++  store: "143441",
++  firstName: "Richard",
++  lastName: "Testperson",
++  passwordToken: "token-must-not-appear",
++  directoryServicesIdentifier: "dsid-must-not-appear",
++  cookies: [],
++  deviceIdentifier: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
++};
++
++describe("DiagnosticsModal", () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++    useAccountsStore.setState({ accounts: [account], loading: false });
++    useSapStore.setState({
++      stage: "assets",
++      percent: 42,
++      error: null,
++      hardwareID: "a1b2c3d4e5f60718293a4b5c6d7e8f90",
++    });
++  });
++
++  it("collects both endpoints and shows a report with no credentials in it", async () => {
++    vi.mocked(apiGet).mockImplementation(async (path: string) => {
++      if (path === "/api/settings")
++        return { buildCommit: "3bc9515", uptime: 99, port: 8080, dataDir: "/data" } as any;
++      if (path === "/api/sap/assets")
++        return {
++          ready: false,
++          available: [],
++          missing: ["CommerceKit", "CommerceCore", "CoreFP", "CoreFP.icxs"],
++          corrupt: [],
++          fetching: false,
++          error: "cannot reach swcdn.apple.com: TLS disconnected.\nSet SAP_ASSETS_DIR.",
++        } as any;
++      throw new Error(`unexpected path ${path}`);
++    });
++
++    render(<DiagnosticsModal open onClose={() => {}} />);
++
++    const report = await waitFor(() => {
++      const pre = screen.getByLabelText("settings.diagnostics.reportLabel");
++      expect(pre.textContent).toContain("[sap assets]");
++      return pre.textContent!;
++    });
++
++    expect(vi.mocked(apiGet)).toHaveBeenCalledWith("/api/settings");
++    expect(vi.mocked(apiGet)).toHaveBeenCalledWith("/api/sap/assets");
++
++    expect(report).toContain("buildCommit: 3bc9515");
++    expect(report).toContain("missing: CommerceKit, CommerceCore, CoreFP, CoreFP.icxs");
++    expect(report).toContain("Set SAP_ASSETS_DIR.");
++    expect(report).toContain("r***@example.com");
++
++    for (const secret of [SECRET, "token-must-not-appear", "dsid-must-not-appear", "richard@example.com"]) {
++      expect(report).not.toContain(secret);
++    }
++  });
++
++  it("still produces a report when the server does not answer", async () => {
++    vi.mocked(apiGet).mockRejectedValue(new Error("Failed to fetch"));
++
++    render(<DiagnosticsModal open onClose={() => {}} />);
++
++    const report = await waitFor(() => {
++      const pre = screen.getByLabelText("settings.diagnostics.reportLabel");
++      expect(pre.textContent).toContain("[signer]");
++      return pre.textContent!;
++    });
++
++    expect(report).toContain("unreachable: Failed to fetch");
++    expect(report).toContain("stage: assets");
++  });
++
++  it("copies the report to the clipboard on request", async () => {
++    vi.mocked(apiGet).mockImplementation(async (path: string) =>
++      path === "/api/settings" ? ({ buildCommit: "3bc9515" } as any) : ({ ready: true } as any),
++    );
++    // Defined after setup(): userEvent installs its own clipboard stub, so
++    // anything set beforehand gets replaced.
++    const user = userEvent.setup();
++    const writeText = vi.fn().mockResolvedValue(undefined);
++    Object.defineProperty(navigator, "clipboard", {
++      value: { writeText },
++      configurable: true,
++    });
++
++    render(<DiagnosticsModal open onClose={() => {}} />);
++
++    await waitFor(() =>
++      expect(screen.getByLabelText("settings.diagnostics.reportLabel").textContent).toContain("[sap assets]"),
++    );
++
++    await user.click(screen.getByRole("button", { name: "settings.diagnostics.copy" }));
++
++    await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
++    const copied = writeText.mock.calls[0][0] as string;
++    expect(copied).toContain("AssppWeb diagnostics");
++    expect(copied).not.toContain(SECRET);
++  });
++});
+diff --git a/frontend/tests/utils/diagnostics.test.ts b/frontend/tests/utils/diagnostics.test.ts
+new file mode 100644
+index 0000000..50499dc
+--- /dev/null
++++ b/frontend/tests/utils/diagnostics.test.ts
+@@ -0,0 +1,197 @@
++import { describe, expect, it } from "vitest";
++import {
++  buildDiagnostics,
++  maskEmail,
++  maskHardwareID,
++  type DiagnosticsInput,
++} from "../../src/utils/diagnostics";
++import type { Account } from "../../src/types";
++
++// The whole point of this report is that it can be pasted into a public issue.
++// These tests hold it to that: the credential fields are given distinctive
++// values, and the assertions are that those values do not appear anywhere.
++const SECRET_PASSWORD = "hunter2-super-secret";
++const SECRET_TOKEN = "AQ==passwordTokenThatMustNotLeak";
++const SECRET_COOKIE = "despotlid=cookie-that-must-not-leak";
++const SECRET_DSID = "1234567890-dsid-must-not-leak";
++const GUID = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
++
++const account: Account = {
++  email: "richard@example.com",
++  password: SECRET_PASSWORD,
++  appleId: "1234567890",
++  store: "143441",
++  firstName: "Richard",
++  lastName: "Testperson",
++  passwordToken: SECRET_TOKEN,
++  directoryServicesIdentifier: SECRET_DSID,
++  cookies: [{ name: "despotlid", value: SECRET_COOKIE }],
++  deviceIdentifier: GUID,
++  pod: "25",
++};
++
++function input(overrides: Partial<DiagnosticsInput> = {}): DiagnosticsInput {
++  return {
++    server: {
++      buildCommit: "3bc9515",
++      buildDate: "2026-09-06T00:00:00Z",
++      uptime: 1234,
++      port: 8080,
++      dataDir: "/data",
++      publicBaseUrl: "https://example.hf.space",
++      downloadThreads: 8,
++    },
++    sapAssets: {
++      available: ["CommerceKit"],
++      missing: ["CoreFP", "CoreFP.icxs"],
++      corrupt: [],
++      ready: false,
++      fetching: false,
++      progress: { stage: "locating", found: [] },
++      error: null,
++    },
++    signer: { stage: "assets", percent: 42, error: null, hardwareID: "a1b2…" },
++    accounts: [account],
++    language: "zh-CN",
++    now: new Date("2026-09-06T08:00:00.000Z"),
++    ...overrides,
++  };
++}
++
++describe("masking", () => {
++  it("keeps enough of an email to tell accounts apart and no more", () => {
++    expect(maskEmail("richard@example.com")).toBe("r***@example.com");
++  });
++
++  it("does not reproduce a local part it cannot mask", () => {
++    expect(maskEmail("not-an-email")).toBe("***");
++    expect(maskEmail("@example.com")).toBe("***");
++  });
++
++  it("keeps only a prefix of the device identifier", () => {
++    expect(maskHardwareID(GUID)).toBe("a1b2…");
++    expect(maskHardwareID(null)).toBeNull();
++    // A short id has no safe prefix, so it is dropped rather than shown whole.
++    expect(maskHardwareID("abcd")).toBe("***");
++  });
++});
++
++describe("buildDiagnostics", () => {
++  it("contains no credential from any account", () => {
++    const report = buildDiagnostics(input());
++
++    for (const secret of [
++      SECRET_PASSWORD,
++      SECRET_TOKEN,
++      SECRET_COOKIE,
++      SECRET_DSID,
++      GUID,
++      "richard@example.com",
++      "Richard",
++      "Testperson",
++    ]) {
++      expect(report).not.toContain(secret);
++    }
++
++    // And says so, so the reader is not taking it on trust.
++    expect(report).toContain("no password, passwordToken, cookie or DSID");
++  });
++
++  it("still reports what is useful about each account", () => {
++    const report = buildDiagnostics(input());
++
++    expect(report).toContain("count: 1");
++    expect(report).toContain("r***@example.com");
++    expect(report).toContain("store=143441");
++    expect(report).toContain("hasPassword=yes");
++    expect(report).toContain("guid=a1b2…");
++  });
++
++  it("reports an account with no password as such", () => {
++    const report = buildDiagnostics(
++      input({ accounts: [{ ...account, password: "" }] }),
++    );
++
++    expect(report).toContain("hasPassword=no");
++  });
++
++  it("reports the SAP asset state, which is what decides most diagnoses", () => {
++    const report = buildDiagnostics(input());
++
++    expect(report).toContain("[sap assets]");
++    expect(report).toContain("ready: false");
++    expect(report).toContain("available: CommerceKit");
++    expect(report).toContain("missing: CoreFP, CoreFP.icxs");
++    expect(report).toContain("stage: locating");
++  });
++
++  it("keeps a multi-line server error readable rather than escaping it", () => {
++    const report = buildDiagnostics(
++      input({
++        sapAssets: {
++          ready: false,
++          error:
++            "cannot reach swcdn.apple.com: TLS disconnected.\nSet SAP_ASSETS_DIR.",
++        },
++      }),
++    );
++
++    expect(report).toContain("    cannot reach swcdn.apple.com: TLS disconnected.");
++    expect(report).toContain("    Set SAP_ASSETS_DIR.");
++    expect(report).not.toContain("\\n");
++  });
++
++  it("survives a server that cannot be reached at all", () => {
++    const report = buildDiagnostics(
++      input({ server: null, serverError: "Failed to fetch", sapAssets: null }),
++    );
++
++    expect(report).toContain("unreachable: Failed to fetch");
++    expect(report).toContain("unreadable: unknown");
++    // The rest of the report is still there — a dead API is a finding, not a
++    // reason to hand back nothing.
++    expect(report).toContain("[browser]");
++    expect(report).toContain("[signer]");
++  });
++
++  it("includes the signer stage and its error", () => {
++    const report = buildDiagnostics(
++      input({
++        signer: {
++          stage: "error",
++          percent: null,
++          error: "timed out preparing the SAP signer",
++          hardwareID: "a1b2…",
++        },
++      }),
++    );
++
++    expect(report).toContain("stage: error");
++    expect(report).toContain("    timed out preparing the SAP signer");
++  });
++
++  it("identifies the build and the browser, since fixes land per build", () => {
++    const report = buildDiagnostics(input());
++
++    expect(report).toContain("buildCommit: 3bc9515");
++    expect(report).toContain("generated: 2026-09-06T08:00:00.000Z");
++    expect(report).toContain("language: zh-CN");
++    expect(report).toContain("secureContext:");
++    expect(report).toContain("worker:");
++  });
++
++  it("reads as plain text, not as something that needs a terminal", () => {
++    const report = buildDiagnostics(input());
++
++    expect(report).not.toMatch(/[\u001b\u009b]/);
++    expect(report).not.toContain("<");
++    expect(report.split("\n").every((l) => l.length < 200)).toBe(true);
++  });
++
++  it("handles having no accounts", () => {
++    const report = buildDiagnostics(input({ accounts: [] }));
++
++    expect(report).toContain("count: 0");
++    expect(report).not.toContain("  - ");
++  });
++});
+-- 
+2.39.5
+

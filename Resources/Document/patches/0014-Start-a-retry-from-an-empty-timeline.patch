@@ -1,0 +1,195 @@
+From bec8264a560e8c796b577f02da281c618a7f8d2b Mon Sep 17 00:00:00 2001
+From: arena-agent <arena-agent@local>
+Date: Sun, 6 Sep 2026 15:07:49 +0000
+Subject: [PATCH] Start a retry from an empty timeline
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A report from a desktop arrived reading setupSeconds: 13 with a timeline whose
+first entry was at +118.8s. begin() reset setupStartedAt but left events in
+place, so a retry appended to the previous attempt's list and the timeline —
+which measures from events[0] — was anchored to the attempt before it. Every
+offset in that report was wrong.
+
+begin() now starts from an empty timeline.
+
+It also keeps the failure reason. A retry used to clear error, so the one piece
+of evidence about the attempt that had just died was erased by the act of
+trying again, and "the status line disappeared on its own" was left with
+nothing behind it. It now moves into lastError and the report prints it as
+previousAttemptFailed.
+
+Co-authored-by: arena-agent <297053741+arena-agent@users.noreply.github.com>
+---
+ .../components/Settings/DiagnosticsModal.tsx  |  3 +-
+ frontend/src/store/sap.ts                     | 21 +++++++--
+ frontend/src/utils/diagnostics.ts             | 12 ++++-
+ frontend/tests/store/sap.test.ts              | 45 ++++++++++++++++++-
+ 4 files changed, 75 insertions(+), 6 deletions(-)
+
+diff --git a/frontend/src/components/Settings/DiagnosticsModal.tsx b/frontend/src/components/Settings/DiagnosticsModal.tsx
+index bf6eb18..1be5629 100644
+--- a/frontend/src/components/Settings/DiagnosticsModal.tsx
++++ b/frontend/src/components/Settings/DiagnosticsModal.tsx
+@@ -32,7 +32,7 @@ export default function DiagnosticsModal({
+ }) {
+   const { t, i18n } = useTranslation();
+   const accounts = useAccountsStore((state) => state.accounts);
+-  const { stage, percent, error, hardwareID, setupStartedAt, events } =
++  const { stage, percent, error, hardwareID, setupStartedAt, events, lastError } =
+     useSapStore();
+   const addToast = useToastStore((state) => state.addToast);
+ 
+@@ -95,6 +95,7 @@ export default function DiagnosticsModal({
+                 : Math.round((Date.now() - setupStartedAt) / 1000),
+             events,
+             error,
++            lastError,
+             hardwareID: maskHardwareID(hardwareID),
+           },
+           accounts,
+diff --git a/frontend/src/store/sap.ts b/frontend/src/store/sap.ts
+index 2a31eb8..d70ff07 100644
+--- a/frontend/src/store/sap.ts
++++ b/frontend/src/store/sap.ts
+@@ -47,7 +47,15 @@ interface SapStore {
+    */
+   setupStartedAt: number | null;
+   /**
+-   * Every setup step seen this session, oldest first.
++   * Why the previous attempt failed, kept across retries.
++   *
++   * A retry used to clear the error, so the one piece of evidence about the
++   * attempt that just died was erased by the act of trying again — and "the
++   * status line disappeared" was left with nothing behind it.
++   */
++  lastError: string | null;
++  /**
++   * Every setup step of the current attempt, oldest first.
+    *
+    * Setup is minutes long and reports no progress, so after the fact the only
+    * evidence of what happened is this list. Bounded, because a session can
+@@ -74,18 +82,25 @@ export const useSapStore = create<SapStore>((set) => ({
+   stage: "idle",
+   percent: null,
+   setupStartedAt: null,
++  lastError: null,
+   events: [],
+   error: null,
+   hardwareID: null,
+ 
++  // A new attempt starts from nothing. The events used to survive, so the
++  // next report mixed two attempts and measured its timeline from the first
++  // event of the previous one — which read as a step starting 118 seconds
++  // into a setup that was 13 seconds old.
+   begin: (hardwareID) =>
+-    set({
++    set((state) => ({
+       stage: "assets",
+       percent: 0,
+       setupStartedAt: null,
++      events: [],
++      lastError: state.error ?? state.lastError,
+       error: null,
+       hardwareID,
+-    }),
++    })),
+   setInstalling: () => set({ stage: "installing", percent: null }),
+   setAssets: (percent) => set({ stage: "assets", percent }),
+   // Timestamped once, on entry. Re-entering the stage is a fresh setup and
+diff --git a/frontend/src/utils/diagnostics.ts b/frontend/src/utils/diagnostics.ts
+index 8bb3b86..aae24ca 100644
+--- a/frontend/src/utils/diagnostics.ts
++++ b/frontend/src/utils/diagnostics.ts
+@@ -77,9 +77,11 @@ export interface DiagnosticsInput {
+      * into a wait that has no other observable the reader is.
+      */
+     setupSeconds: number | null;
+-    /** Every setup step seen this session, oldest first. */
++    /** Every setup step of the current attempt, oldest first. */
+     events: SapEvent[];
+     error: string | null;
++    /** Why the previous attempt failed, if it did. */
++    lastError?: string | null;
+     /** Masked before it gets here; see maskHardwareID. */
+     hardwareID: string | null;
+   };
+@@ -285,6 +287,14 @@ export function buildDiagnostics(input: DiagnosticsInput): string {
+       out.push(`    ${part}`);
+     }
+   }
++  // Kept across retries: a status line that vanishes and a fresh attempt that
++  // looks clean are indistinguishable without it.
++  if (input.signer.lastError) {
++    out.push("  previousAttemptFailed:");
++    for (const part of String(input.signer.lastError).split("\n")) {
++      out.push(`    ${part}`);
++    }
++  }
+   out.push("");
+ 
+   out.push("[accounts]");
+diff --git a/frontend/tests/store/sap.test.ts b/frontend/tests/store/sap.test.ts
+index d4132ca..158249b 100644
+--- a/frontend/tests/store/sap.test.ts
++++ b/frontend/tests/store/sap.test.ts
+@@ -10,7 +10,7 @@ const T0 = Date.parse("2026-09-06T12:20:00.000Z");
+ 
+ describe("recording setup steps", () => {
+   beforeEach(() => {
+-    useSapStore.setState({ events: [], stage: "idle", percent: null, setupStartedAt: null, error: null, hardwareID: null });
++    useSapStore.setState({ events: [], stage: "idle", percent: null, setupStartedAt: null, lastError: null, error: null, hardwareID: null });
+   });
+ 
+   it("folds a step's end into its begin instead of appending a second entry", () => {
+@@ -59,3 +59,46 @@ describe("recording setup steps", () => {
+     expect(events[1].endedAt).toBeUndefined();
+   });
+ });
++
++// A report arrived reading `setupSeconds: 13` alongside a timeline whose first
++// entry was at +118.8s. begin() reset setupStartedAt but kept the events, so a
++// retry measured its timeline from the previous attempt.
++describe("starting a new attempt", () => {
++  beforeEach(() => {
++    useSapStore.setState({ events: [], stage: "idle", percent: null, setupStartedAt: null, lastError: null, error: null, hardwareID: null });
++  });
++
++  it("drops the previous attempt's steps", () => {
++    const store = useSapStore.getState();
++    store.recordEvent({ label: "machine.open", at: T0 });
++    store.setSetup();
++
++    useSapStore.getState().begin("ffff");
++
++    const after = useSapStore.getState();
++    expect(after.events).toEqual([]);
++    // A fresh timeline has to start from the new attempt, or the report mixes
++    // two of them and every offset in it is wrong.
++    expect(after.setupStartedAt).toBeNull();
++  });
++
++  it("keeps the reason the previous attempt failed", () => {
++    useSapStore.getState().setError("SAP guest call exceeded 180s");
++
++    useSapStore.getState().begin("ffff");
++
++    const after = useSapStore.getState();
++    // Retrying is how the evidence used to get erased.
++    expect(after.error).toBeNull();
++    expect(after.lastError).toBe("SAP guest call exceeded 180s");
++  });
++
++  it("keeps the most recent failure across several retries", () => {
++    useSapStore.getState().setError("first");
++    useSapStore.getState().begin("aaaa");
++    useSapStore.getState().setError("second");
++    useSapStore.getState().begin("bbbb");
++
++    expect(useSapStore.getState().lastError).toBe("second");
++  });
++});
+-- 
+2.39.5
+
